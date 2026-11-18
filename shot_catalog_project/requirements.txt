@@ -1,0 +1,5 @@
+# Runtime dependencies. The target environment had no pip/venv available, so
+# these are installed into a self-contained prefix (see scripts/bootstrap.sh);
+# pinning keeps the one-command verification reproducible.
+duckdb==2.0.0
+pytest==9.2.0
