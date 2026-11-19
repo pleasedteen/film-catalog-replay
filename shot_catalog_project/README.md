@@ -140,9 +140,18 @@
 ### 崩溃恢复
 
 每次提交依赖 DuckDB 的 WAL 持久化，批组边界额外 `CHECKPOINT`。进程被 `SIGKILL` 后，
-重启打开同一个文件：`last_snapshot_seq` 指向最后一个完整提交的前缀，同步器从该前缀附近重新拉页
-（重复投递本就幂等），继续追赶。已保存进度与查询结果始终对应同一段完整历史。
-恢复过程中查询服务继续响应；每个请求在单一连接的锁内读到一个一致快照。
+重启打开同一个文件：`last_snapshot_seq` 指向最后一个完整提交的前缀，同步器从持久状态继续。
+
+续跑点按**第一个未暂存 seq**（而非 `max(staged seq)`）计算：即使后面的页先到、已经把
+源端尾部整段暂存，只要前面缺页，重启后也会回到缺页所在的页重新拉取，缺页补齐之前缺页
+之后的任何组（含整批修订）都保持不可见。已经完整暂存的页在拉取循环里直接跳过、不再发
+HTTP 请求，所以重启只补拉缺页。源端最后一个完整批次（批次一直延伸到源端尾部、后面没有
+边界记录）在确认暂存已覆盖源端 `total` 后同样可以发布。已保存进度与查询结果始终对应同
+一段完整历史。恢复过程中查询服务继续响应；每个请求在单一连接的锁内读到一个一致快照。
+
+`scripts/regression_kill_resume.py` 用真实子进程把上述流程一键跑完：先制造“后页先到”并
+`SIGKILL`，再在缺页持续 500 的情况下重启，最后放开缺页补齐；脚本核对每一次 `/logs` 请求
+范围（完整暂存页零请求、只补拉缺页）以及发布前后的目录快照。
 
 ---
 
@@ -167,8 +176,10 @@ shot_catalog_project/
 │   ├── verify.sh                # 一键验证（80 秒预算）
 │   ├── demo.py                  # 混合版本端到端演示
 │   ├── demo_large_batch.py      # 跨页十万级同批修订演示
+│   ├── controllable_source.py   # 可拦截/重定向分页的日志源代理（回归用）
+│   ├── regression_kill_resume.py # 强制终止/重启/缺页补齐一键回归
 │   └── _sync_worker.py          # 恢复测试用的一次性同步 worker
-└── tests/                       # 31 个自动化测试
+└── tests/                       # 35 个自动化测试
 ```
 
 ---
@@ -190,7 +201,7 @@ scripts/verify.sh
 ```
 
 它会运行覆盖全部必需场景的代表性测试、混合版本演示、跨页同批修订演示，并打印可读的分节结果。
-完整 31 项测试可随时单独运行：
+完整 35 项测试可随时单独运行：
 
 ```bash
 python3 -I run_tests.py -q
@@ -227,6 +238,17 @@ python3 -I scripts/demo_large_batch.py 3000   # 缩小规模快速演示
 python3 -I scripts/_sync_worker.py run/catalog.duckdb http://127.0.0.1:8081 100 0
 ```
 
+### 6.7 强制终止 / 重启 / 缺页补齐回归（一条命令）
+
+```bash
+python3 -I scripts/regression_kill_resume.py
+```
+
+它在本地起一个可拦截、可重定向分页的日志源代理，用三个真实 worker 进程完成：
+后页先到 → `SIGKILL` → 缺页持续 500 下重启（只请求缺页）→ 放开缺页后整批原子发布，
+并把请求范围审计（`source_audit.jsonl`）与发布前后快照（`snapshot_*.json`）留在
+临时运行目录里供核对。
+
 ---
 
 ## 7. 自动化测试覆盖的场景
@@ -237,8 +259,9 @@ python3 -I scripts/_sync_worker.py run/catalog.duckdb http://127.0.0.1:8081 100 
 | 混合版本修订、秒→毫秒、修复说明保留 | `test_log_format.py`、`test_v1_revision_cannot_erase_v2_repair_note`、`test_durations_always_milliseconds` |
 | 部分修订与清空说明 | `test_explicit_null_clears_but_still_present`、`test_explicit_description_clearing` |
 | 撤回后重新发布 | `test_withdrawn_shot_is_unretrievable`、`test_republished_shot_is_retrievable` |
-| 跨页大批修订的原子性 | `test_batch_atomicity.py`（半批不可见、整批一次可见、跨 15+ 页） |
-| 终止后恢复 | `test_reopen_continues_from_durable_prefix`、`test_sigkill_then_restart_resumes`（真实子进程 SIGKILL） |
+| 跨页大批修订的原子性 | `test_batch_atomicity.py`（半批不可见、整批一次可见、跨 15+ 页、源端尾部完整批次可发布、后页先到须等缺页、重启只补缺页） |
+| 终止后恢复 | `test_reopen_continues_from_durable_prefix`、`test_reopen_backfills_hole_when_later_pages_arrived_first`、`test_sigkill_then_restart_resumes`（真实子进程 SIGKILL） |
+| 强制终止/重启/补齐回归 | `scripts/regression_kill_resume.py`（请求范围审计 + 发布前后快照核对，一条命令） |
 | 同步期间查询一致 | `test_http_api.py::test_concurrent_reads_while_syncing`、`test_film_listing_is_one_consistent_snapshot` |
 
 夹具（`fixturegen.py`）是真实生成的提交历史：v1 与 v2 记录交错修订同一批镜头、

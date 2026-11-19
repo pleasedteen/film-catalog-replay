@@ -6,6 +6,7 @@ import pytest
 
 from shot_catalog.catalog import Catalog
 from shot_catalog.fixturegen import generate_large_history
+from shot_catalog.log_format import normalize
 from shot_catalog.log_store import PagedLogSource, serve
 from shot_catalog.sync import LogSourceClient, SyncEngine
 
@@ -124,5 +125,134 @@ def test_batch_becomes_visible_atomically_after_completion(catalog, medium_histo
         # After the whole run, the final catalog includes the LW* rows too.
         assert catalog.stats()["visible_shots"] == \
             medium_history["expected_visible_count"]
+    finally:
+        httpd.shutdown()
+
+
+def _write_tail_batch_history(path):
+    """Two ordinary events followed by a 3-event batch ending at the tail."""
+    import json
+    recs = [
+        {"seq": 1, "event_id": "e1", "event_type": "upsert", "film_id": "f",
+         "shot_id": "A", "version": 1, "ts": "2026-11-01T00:00:01Z",
+         "payload": {"duration_sec": 1}},
+        {"seq": 2, "event_id": "e2", "event_type": "upsert", "film_id": "f",
+         "shot_id": "B", "version": 1, "ts": "2026-11-01T00:00:02Z",
+         "payload": {"duration_sec": 2}},
+    ]
+    for i, seq in enumerate((3, 4, 5), start=1):
+        recs.append({"seq": seq, "event_id": f"e{seq}", "event_type": "upsert",
+                     "film_id": "f", "shot_id": f"T{i}", "version": 2,
+                     "ts": f"2026-11-01T00:00:0{seq}Z", "batch_id": "B1",
+                     "payload": {"duration_ms": 1000 + i,
+                                 "repair_note": f"tail fix {i}"}})
+    path.write_text("\n".join(json.dumps(r) for r in recs) + "\n",
+                    encoding="utf-8")
+
+
+def test_last_complete_batch_at_source_tail_publishes(tmp_path):
+    """A batch whose run ends exactly at the source tail is publishable."""
+    history = tmp_path / "tail_batch.jsonl"
+    _write_tail_batch_history(history)
+    source = PagedLogSource(history, page_size_hint=2, shuffle=True,
+                            duplicate_rate=0.3, error_rate=0.1, seed=4)
+    httpd = serve(source, "127.0.0.1", 0)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    db = tmp_path / "tail.duckdb"
+    try:
+        with Catalog(db) as cat:
+            engine = SyncEngine(cat, LogSourceClient(f"http://127.0.0.1:{port}"),
+                                page_size=2, poll_interval=0.0)
+            engine.run_until_caught_up(max_passes=40, idle_passes_to_stop=2)
+            assert cat.last_snapshot_seq() == 5
+            assert engine.counters.batch_groups_committed == 1
+            # The batch shots carry the batch values, all visible at once.
+            for i, seq_shot in enumerate(("T1", "T2", "T3"), start=1):
+                shot = cat.get_shot("f", seq_shot)
+                assert shot is not None
+                assert shot["duration_ms"] == 1000 + i
+                assert shot["repair_note"] == f"tail fix {i}"
+            assert cat.rebuild_mismatch_count() == 0
+    finally:
+        httpd.shutdown()
+
+
+def test_later_pages_first_waits_for_missing_page_then_publishes_batch(tmp_path):
+    """Pages beyond a hole may stage first, but the batch waits for the hole."""
+    history = tmp_path / "tail_batch.jsonl"
+    _write_tail_batch_history(history)
+    # Deterministic, chaos-free source so request ranges are easy to reason about.
+    source = PagedLogSource(history, page_size_hint=2, shuffle=False,
+                            duplicate_rate=0.0, error_rate=0.0)
+    httpd = serve(source, "127.0.0.1", 0)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    db = tmp_path / "hole.duckdb"
+    try:
+        client = LogSourceClient(f"http://127.0.0.1:{port}")
+        with Catalog(db) as cat:
+            # Out-of-order delivery: the final page (seqs 5, batch tail) and
+            # the middle page (seqs 3-4, start of batch B1) arrive while the
+            # very first page (seqs 1-2) is still missing.
+            for offset in (4, 2):
+                page = client.fetch_page(offset, 2)
+                cat.stage_records([normalize(r) for r in page["records"]])
+            assert cat.max_staged_seq() == 5
+            assert not cat.is_range_fully_staged(1, 2)
+
+            # Even though the whole batch is already staged, nothing past the
+            # missing prefix page can publish: the snapshot stays at zero.
+            engine = SyncEngine(cat, client, page_size=2, poll_interval=0.0)
+            engine._commit_ready_groups(source_total=5)
+            assert cat.last_snapshot_seq() == 0
+            assert engine.counters.batch_groups_committed == 0
+            assert cat.get_shot("f", "T1") is None
+
+            # Resume must point at the page containing the FIRST unstaged seq,
+            # never at the far tail where the already-staged pages live.
+            assert engine._resume_offset(total=5) == 0
+
+            # Backfill the hole; the ordinary prefix then the whole batch
+            # publish as complete groups in one continuous catch-up.
+            engine.run_until_caught_up(max_passes=10, idle_passes_to_stop=1)
+            assert cat.last_snapshot_seq() == 5
+            assert engine.counters.batch_groups_committed == 1
+            assert cat.get_shot("f", "T1")["repair_note"] == "tail fix 1"
+            assert cat.rebuild_mismatch_count() == 0
+    finally:
+        httpd.shutdown()
+
+
+def test_restart_skips_fully_staged_pages_and_backfills_only_the_hole(tmp_path):
+    """After a restart, fully staged pages are not re-requested; the hole is."""
+    history = tmp_path / "tail_batch.jsonl"
+    _write_tail_batch_history(history)
+    source = PagedLogSource(history, page_size_hint=2, shuffle=False,
+                            duplicate_rate=0.0, error_rate=0.0)
+    httpd = serve(source, "127.0.0.1", 0)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    db = tmp_path / "restart.duckdb"
+    try:
+        client = LogSourceClient(f"http://127.0.0.1:{port}")
+        with Catalog(db) as cat:
+            # Stage the tail pages (offsets 2 and 4) before any "restart".
+            for offset in (4, 2):
+                page = client.fetch_page(offset, 2)
+                cat.stage_records([normalize(r) for r in page["records"]])
+            before_fetches = client
+
+        # Brand-new engine/object over the same durable file, like a restart.
+        with Catalog(db) as cat2:
+            client2 = LogSourceClient(f"http://127.0.0.1:{port}")
+            engine2 = SyncEngine(cat2, client2, page_size=2, poll_interval=0.0)
+            assert engine2._resume_offset(total=5) == 0
+            engine2.run_until_caught_up(max_passes=10, idle_passes_to_stop=1)
+            # Pages at offsets 2 and 4 were fully staged, so only the page at
+            # offset 0 was fetched across the whole resumed run.
+            assert engine2.counters.pages_fetched == 1
+            assert cat2.last_snapshot_seq() == 5
+            assert cat2.rebuild_mismatch_count() == 0
     finally:
         httpd.shutdown()

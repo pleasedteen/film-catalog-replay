@@ -5,11 +5,14 @@
 # PASS/FAIL sections covering every required behavior:
 #
 #   1. automated tests: out-of-order/duplicate delivery, mixed v1/v2 revisions,
-#      withdraw/republish, cross-page batch atomicity, kill-and-restart recovery;
+#      withdraw/republish, cross-page batch atomicity, kill-and-restart recovery
+#      (including gap-aware resume and source-tail batches);
 #   2. end-to-end mixed-version demo with live HTTP queries;
 #   3. a cross-page same-batch revision on a 3,000-shot batch (15+ log pages;
 #      scaled down from 100k only to honor the 80s budget). The full 100k case
 #      runs on demand via: python3 -I scripts/demo_large_batch.py
+#   4. one-command hard-kill / restart / backfill regression using the bundled
+#      logs, auditing request ranges and the before/after catalog snapshots.
 #
 # Usage:  scripts/verify.sh
 set -uo pipefail
@@ -27,7 +30,7 @@ fail() { printf "\033[1;31m%s\033[0m\n" "FAILED: $1"; exit 1; }
 cd "$ROOT"
 START=$(date +%s)
 
-section "1/3 automated tests: representative node from every required scenario"
+section "1/4 automated tests: representative node from every required scenario"
 # One focused test per required behavior keeps the run inside the 80s budget;
 # the FULL suite (31 tests) is available anytime via: python3 -I run_tests.py
 "$PY" -I run_tests.py -q \
@@ -39,16 +42,23 @@ section "1/3 automated tests: representative node from every required scenario"
   tests/test_sync_semantics.py::test_republished_shot_is_retrievable \
   tests/test_batch_atomicity.py::test_half_staged_batch_is_completely_invisible \
   tests/test_batch_atomicity.py::test_batch_spans_many_pages_and_commits_as_one \
+  tests/test_batch_atomicity.py::test_last_complete_batch_at_source_tail_publishes \
+  tests/test_batch_atomicity.py::test_later_pages_first_waits_for_missing_page_then_publishes_batch \
+  tests/test_batch_atomicity.py::test_restart_skips_fully_staged_pages_and_backfills_only_the_hole \
   tests/test_recovery.py::test_reopen_continues_from_durable_prefix \
+  tests/test_recovery.py::test_reopen_backfills_hole_when_later_pages_arrived_first \
   tests/test_recovery.py::test_sigkill_then_restart_resumes \
   tests/test_http_api.py::test_shot_and_film_endpoints \
   || fail "representative pytest subset"
 
-section "2/3 end-to-end mixed-version demo"
+section "2/4 end-to-end mixed-version demo"
 "$PY" -I scripts/demo.py || fail "mixed-version demo"
 
-section "3/3 cross-page same-batch revision (3,000 shots, 15+ pages)"
+section "3/4 cross-page same-batch revision (3,000 shots, 15+ pages)"
 "$PY" -I scripts/demo_large_batch.py 3000 || fail "large-batch demo"
+
+section "4/4 forced kill / restart / gap backfill regression (request-range + snapshot audit)"
+"$PY" -I scripts/regression_kill_resume.py || fail "kill-restart-backfill regression"
 
 ELAPSED=$(( $(date +%s) - START ))
 printf "\n\033[1;32mALL CHECKS PASSED in %ds (budget 80s)\033[0m\n" "$ELAPSED"

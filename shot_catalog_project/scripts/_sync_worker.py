@@ -9,6 +9,7 @@ max_seconds elapses (0 = run to completion). Exit code 0 means fully caught up.
 Runs with isolated mode (-I) so only explicit sys.path entries are used.
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -21,6 +22,15 @@ sys.path[:0] = [
 
 from shot_catalog.catalog import Catalog  # noqa: E402
 from shot_catalog.sync import LogSourceClient, SyncEngine  # noqa: E402
+
+# Structured progress logs: SHOTCAT lines are machine-readable for the
+# regression harness while the standard logging lines stay human-readable.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("sync_worker")
 
 
 def _write_progress(seq: int) -> None:
@@ -50,6 +60,10 @@ def main() -> int:
     with Catalog(db_path) as catalog:
         client = LogSourceClient(url)
         total_events = client.total()
+        log.info("SHOTCAT worker_start db=%s url=%s page_size=%d total=%d "
+                 "resume_snapshot=%d",
+                 db_path, url, page_size, total_events,
+                 catalog.last_snapshot_seq())
         engine = SyncEngine(
             catalog, client, page_size=page_size, poll_interval=0.0,
             on_commit=on_commit,
@@ -64,11 +78,22 @@ def main() -> int:
                     break
                 if catalog.last_snapshot_seq() >= total and total > 0:
                     break
-                engine._pull_and_stage(start_offset=engine._resume_offset())
-                engine._commit_ready_groups()
+                engine._pull_and_stage(start_offset=engine._resume_offset(total),
+                                       total=total)
+                engine._commit_ready_groups(source_total=total)
+                # A blocked/failed page ends the pass early; pace the retry
+                # instead of spinning while the hole stays open.
+                time.sleep(0.1)
         else:
             engine.run_until_caught_up(max_passes=100, idle_passes_to_stop=1)
         _write_progress(catalog.last_snapshot_seq())
+        stats = catalog.stats()
+        log.info("SHOTCAT worker_done snapshot=%d staged=%d max_staged=%d "
+                 "visible=%d pages_fetched=%d batch_groups=%d",
+                 catalog.last_snapshot_seq(), stats["staged_events"],
+                 stats["max_staged_seq"], stats["visible_shots"],
+                 engine.counters.pages_fetched,
+                 engine.counters.batch_groups_committed)
         print(f"snapshot_seq={catalog.last_snapshot_seq()} "
               f"visible={catalog.stats()['visible_shots']}")
         return 0

@@ -290,6 +290,49 @@ class Catalog:
             row = self._conn.execute("SELECT max(seq) FROM event_staging").fetchone()
         return int(row[0] or 0)
 
+    def first_unstaged_seq(self, after_seq: int, upper_bound: int) -> int:
+        """Smallest seq > ``after_seq`` and <= ``upper_bound`` not yet staged.
+
+        Returns ``upper_bound + 1`` when every seq in that window is already
+        durably staged. Unlike a ``max(seq)``-based resume point, this honors
+        holes: if pages after a gap arrived first, the gap itself -- not the
+        far tail -- is where the next fetch must resume.
+        """
+        if upper_bound <= after_seq:
+            return after_seq + 1
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT first_missing
+                FROM (
+                    SELECT r.seq AS first_missing
+                    FROM range(CAST(? AS BIGINT) + 1, CAST(? AS BIGINT) + 1) AS r(seq)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM event_staging e WHERE e.seq = r.seq
+                    )
+                    ORDER BY r.seq
+                    LIMIT 1
+                )
+                """,
+                [after_seq, upper_bound],
+            ).fetchone()
+        return int(row[0]) if row is not None else upper_bound + 1
+
+    def is_range_fully_staged(self, start_seq: int, end_seq: int) -> bool:
+        """True when every seq in the inclusive window exists in staging."""
+        if end_seq < start_seq:
+            return True
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT count(*) = CAST(? AS BIGINT) - CAST(? AS BIGINT) + 1
+                FROM event_staging
+                WHERE seq BETWEEN ? AND ?
+                """,
+                [end_seq, start_seq, start_seq, end_seq],
+            ).fetchone()
+        return bool(row[0])
+
     def last_snapshot_seq(self) -> int:
         with self._lock:
             return int(
@@ -299,13 +342,17 @@ class Catalog:
             )
 
     # ------------------------------------------------------------- group logic
-    def next_committable_group(self) -> CommitGroup | None:
+    def next_committable_group(self, source_total: int | None = None) -> CommitGroup | None:
         """Return the next prefix group whose whole run is durably staged.
 
         Ordinary records form single-seq groups; records sharing a batch_id
         form one group spanning their full contiguous run. A group is
         committable only when the whole run is staged and attaches exactly to
         the published prefix. A half-staged batch blocks everything after it.
+
+        A batch run whose end coincides with the known source tail is complete
+        even though no boundary row follows it: the source has no further
+        records, so the last complete batch at the tail is publishable.
         """
         with self._lock:
             start = self.last_snapshot_seq() + 1
@@ -325,7 +372,9 @@ class Catalog:
             # start delimits the run. A batch is complete only when that
             # boundary row is actually staged (different/no batch_id). If the
             # run instead ends at the staging tail with no boundary row, the
-            # batch is still being delivered and must wait.
+            # batch is still being delivered and must wait -- unless its end is
+            # the known, immutable source tail, in which case no boundary row
+            # can ever arrive and the complete batch must publish.
             boundary = self._conn.execute(
                 """
                 WITH marked AS (
@@ -345,6 +394,11 @@ class Catalog:
             # First row of this region is `start` itself (no predecessor in
             # window); the second row is the run boundary that follows it.
             if len(boundary) < 2:
+                max_staged = self.max_staged_seq()
+                if source_total is not None and max_staged >= source_total:
+                    # The run reaches the source tail with no missing seqs:
+                    # this is the source's last complete batch.
+                    return CommitGroup(start, source_total, batch_id)
                 return None  # run reaches the staged tail; batch incomplete
             boundary_seq, boundary_batch = boundary[1]
             if boundary_batch == batch_id:

@@ -109,39 +109,64 @@ class SyncEngine:
         self._stop = True
 
     # ------------------------------------------------------------- one pass
-    def _pull_and_stage(self, start_offset: int = 0) -> int:
-        """Fetch pages from ``start_offset`` to the source tail; return total."""
+    def _pull_and_stage(self, start_offset: int = 0,
+                        total: int | None = None) -> int:
+        """Fetch pages from ``start_offset`` to the source tail; return total.
+
+        Pages whose whole seq window is already durably staged are skipped
+        without a request, so after a restart only missing pages are
+        re-pulled: a completely staged page is never fetched again. Fetching
+        always resumes at the first *unstaged* page (see
+        :meth:`_resume_offset`), so pages that arrived before a missing page
+        cannot make the engine jump past the gap.
+        """
         offset = start_offset
-        total = None
+        if total is None:
+            total = self.client.total()
+        reached_tail = False
         while not self._stop:
-            try:
-                page = self.client.fetch_page(offset, self.page_size)
-            except urllib.error.HTTPError as exc:
-                if exc.code >= 500:
-                    self.counters.transient_errors += 1
-                raise
-            self.counters.pages_fetched += 1
-            total = page["total"]
-            raw_records = page["records"]
-            normalized: list[NormalizedRecord] = []
-            for raw in raw_records:
+            page_end = min(offset + self.page_size - 1, total)
+            if self.catalog.is_range_fully_staged(offset + 1, page_end):
+                log.info("skip fully-staged page offset=%d seqs=%d..%d",
+                         offset, offset + 1, page_end)
+            else:
                 try:
-                    normalized.append(normalize(raw))
-                except LogFormatError:
-                    log.exception("malformed record skipped at offset %s", offset)
-                    continue
-            self.counters.records_seen += len(raw_records)
-            staged = self.catalog.stage_records(normalized)
-            self.counters.records_newly_staged += staged
-            if not page["has_more"]:
+                    page = self.client.fetch_page(offset, self.page_size)
+                except urllib.error.HTTPError as exc:
+                    if exc.code >= 500:
+                        # Retries inside the client are exhausted; leave the
+                        # page un-staged and end this pass. The page keeps its
+                        # place as the first-unstaged page, so the next pass
+                        # re-requests exactly it instead of jumping past it.
+                        self.counters.transient_errors += 1
+                        log.warning("page offset=%d unavailable after retries; "
+                                    "will retry next pass", offset)
+                        return total or 0
+                    raise
+                self.counters.pages_fetched += 1
+                total = page["total"]
+                raw_records = page["records"]
+                normalized: list[NormalizedRecord] = []
+                for raw in raw_records:
+                    try:
+                        normalized.append(normalize(raw))
+                    except LogFormatError:
+                        log.exception("malformed record skipped at offset %s", offset)
+                        continue
+                self.counters.records_seen += len(raw_records)
+                staged = self.catalog.stage_records(normalized)
+                self.counters.records_newly_staged += staged
+                log.info("fetched page offset=%d seqs=%d..%d new_staged=%d",
+                         offset, offset + 1, page_end, staged)
+                reached_tail = not page["has_more"]
+            if reached_tail or offset + self.page_size >= total:
                 break
             # Overlapping pages are allowed; advance by page_size regardless.
             offset += self.page_size
-            if offset >= total:
-                break
         return total or 0
 
-    def _commit_ready_groups(self, ordinary_flush_size: int = 5000) -> None:
+    def _commit_ready_groups(self, ordinary_flush_size: int = 5000,
+                             source_total: int | None = None) -> None:
         """Commit every prefix group that is fully staged.
 
         Same-batch revisions are always applied as their own atomic group.
@@ -151,7 +176,7 @@ class SyncEngine:
         durable snapshot only through complete, contiguous history.
         """
         while not self._stop:
-            group = self.catalog.next_committable_group()
+            group = self.catalog.next_committable_group(source_total)
             if group is None:
                 return
             if group.batch_id is not None:
@@ -193,8 +218,8 @@ class SyncEngine:
 
     def run_once(self) -> SyncCounters:
         """Fetch everything currently available and commit all ready groups."""
-        self._pull_and_stage()
-        self._commit_ready_groups()
+        total = self._pull_and_stage()
+        self._commit_ready_groups(source_total=total)
         return self.counters
 
     def run_forever(self) -> None:
@@ -206,14 +231,17 @@ class SyncEngine:
             try:
                 total = self.client.total()
                 if self.catalog.last_snapshot_seq() < total:
-                    # Only refetch from the first possibly-unstaged page.
-                    self._pull_and_stage(start_offset=next_offset)
-                    self._commit_ready_groups()
-                    # Everything covered up to max_staged_seq is now fetchable;
-                    # next poll starts one page after it (overlap is harmless).
-                    next_offset = self._resume_offset()
+                    # Only refetch from the first page containing an unstaged
+                    # seq; fully staged pages inside the window are not
+                    # requested again.
+                    total = self._pull_and_stage(start_offset=next_offset,
+                                                 total=total)
+                    self._commit_ready_groups(source_total=total)
+                    next_offset = self._resume_offset(total)
                 else:
-                    # Source may grow later; keep the offset at the tail.
+                    # Caught up; park at the tail page boundary. When the
+                    # source grows, _resume_offset points at the first new
+                    # (possibly partially filled) page again.
                     next_offset = max(0, total - (total % self.page_size))
             except urllib.error.URLError:
                 log.warning("log source unreachable, retrying", exc_info=True)
@@ -221,24 +249,32 @@ class SyncEngine:
         log.info("sync loop stopped at snapshot seq %d",
                  self.catalog.last_snapshot_seq())
 
-    def _resume_offset(self) -> int:
-        """Lowest page offset that could contain an unstaged seq.
+    def _resume_offset(self, total: int | None = None) -> int:
+        """Page offset that contains the first unstaged seq.
 
-        Back off one page from the max staged seq so a page that failed or
-        arrived partially is re-requested; overlapping redelivery is cheap and
-        idempotent.
+        The resume point is derived from the *first missing seq* of the
+        prefix window rather than from ``max(staged seq)``: when later pages
+        arrive before an earlier one (or an earlier page was lost across a
+        restart), the engine must go back to the hole and backfill it before
+        anything beyond the hole can publish. When nothing is missing the
+        result lands exactly on the tail page boundary, so completely staged
+        pages are never re-requested.
         """
-        max_staged = self.catalog.max_staged_seq()
-        if max_staged == 0:
-            return 0
-        raw = max(0, max_staged - self.page_size)
-        return (raw // self.page_size) * self.page_size
+        if total is None:
+            total = self.client.total()
+        first_missing = self.catalog.first_unstaged_seq(
+            self.catalog.last_snapshot_seq(), total
+        )
+        if first_missing > total:
+            # Everything up to the known source tail is staged: park on the
+            # last page boundary (a zero-width offset when tail == page size).
+            return max(0, total - (total % self.page_size))
+        return ((first_missing - 1) // self.page_size) * self.page_size
 
     def run_until_caught_up(self, *, max_passes: int = 200,
                             idle_passes_to_stop: int = 2) -> SyncCounters:
         """Run until snapshot covers the whole source history (demo/tests)."""
         idle = 0
-        next_offset = self._resume_offset()
         for _ in range(max_passes):
             if self._stop:
                 break
@@ -254,8 +290,8 @@ class SyncEngine:
                 self._sleep(self.poll_interval)
                 continue
             idle = 0
-            self._pull_and_stage(start_offset=next_offset)
-            self._commit_ready_groups()
-            next_offset = self._resume_offset()
+            next_offset = self._resume_offset(total)
+            total = self._pull_and_stage(start_offset=next_offset, total=total)
+            self._commit_ready_groups(source_total=total)
             self._sleep(self.poll_interval)
         return self.counters
