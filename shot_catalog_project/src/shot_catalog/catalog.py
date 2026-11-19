@@ -28,18 +28,33 @@ proportional to group size, never to history size, and no batch is ever
 assembled in Python: the only arguments are two seq integers. Partial
 revisions are honored via per-attribute ``*_changed`` flags; explicit nulls
 flip the flag while carrying a null value, so they can clear an attribute.
+
+Readers do not share the writer
+===============================
+The writer connection (staging + commit) is guarded by ``_lock``. Queries,
+by contrast, each open their own short-lived DuckDB connection and pin an
+explicit read transaction: DuckDB MVCC then shows them the last committed
+snapshot even while the writer is in the middle of a (possibly long, possibly
+paused) transaction, and a writer commit never waits for a slow reader. A film
+listing streams its rows in key-set pages *inside* that one read transaction,
+so snapshot marker, count and shots all describe one version while Python
+only ever buffers one small page.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import duckdb
 
 from .log_format import NormalizedRecord
+
+log = logging.getLogger("shot_catalog.catalog")
 
 STAGING_COLUMNS = """
     seq BIGINT PRIMARY KEY,
@@ -83,6 +98,17 @@ STATE_COLUMNS = """
 """
 
 _ATTRS = ("title", "description", "duration_ms", "scene", "camera", "repair_note")
+
+# Columns (and their order) of one shot in a film listing; identical to
+# ``GET /shot``'s payload so the streaming and point-query paths agree.
+LISTING_COLUMNS = (
+    "film_id", "shot_id", "version", "last_event_seq", "last_ts",
+    "title", "description", "duration_ms", "scene", "camera", "repair_note",
+)
+_LISTING_SELECT = ", ".join(LISTING_COLUMNS)
+# Rows fetched per key-set step while streaming a film listing. This is the
+# only listing data buffered in Python at any moment.
+LISTING_CHUNK = 256
 
 # Per-shot delta for one seq range, evaluated entirely inside DuckDB. A single
 # GROUP BY finds each attribute's last present-event seq (and the latest
@@ -177,10 +203,12 @@ class CommitGroup:
 class Catalog:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
-        # One connection guarded by an RLock: DuckDB disallows mixing
-        # read-only and read-write connections to one file in a process.
-        # Reads are short autocommit statements, so a film listing observes
-        # one coherent MVCC snapshot while the sync thread waits its turn.
+        # The writer connection is guarded by this lock; DuckDB permits only
+        # one read-write connection per file in a process, so all mutations,
+        # schema work and temp tables go through it. Readers use their own
+        # connections (see ``_read_conn``), which is what lets a query be
+        # answered from the last published version while a write transaction
+        # is paused, and lets later batches commit while a client is slow.
         self._lock = threading.RLock()
         self._conn = duckdb.connect(self.db_path)
         self._stage_ready = False
@@ -231,6 +259,33 @@ class Catalog:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # ------------------------------------------------------------------ readers
+    @contextmanager
+    def _read_conn(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Open a short-lived reader connection pinned to one committed snapshot.
+
+        Readers deliberately do NOT take ``_lock`` and do NOT share the writer
+        connection: DuckDB's MVCC then serves them the last committed version
+        while the writer is mid-transaction (even a paused or very long one),
+        and commits never wait for a reader. The explicit transaction keeps
+        the snapshot fixed across every statement of one request.
+        """
+        conn = duckdb.connect(self.db_path)
+        try:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                yield conn
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except duckdb.Error:
+                    pass
+                raise
+            else:
+                conn.execute("COMMIT")
+        finally:
+            conn.close()
 
     def __enter__(self) -> "Catalog":
         return self
@@ -363,6 +418,20 @@ class Catalog:
             return None
         return int(row[0]), row[1]
 
+    def _checkpoint(self) -> None:
+        """Flush the WAL, tolerating readers that hold a long-lived snapshot.
+
+        DuckDB refuses CHECKPOINT while another connection still has an open
+        read transaction (e.g. a client streaming a film listing slowly).
+        That must never fail a commit: the commit is already durable in the
+        WAL, the checkpoint is only an optimisation, and the next commit will
+        retry it. The writer connection stays usable either way.
+        """
+        try:
+            self._conn.execute("CHECKPOINT")
+        except duckdb.TransactionException:
+            log.debug("checkpoint deferred: a reader still holds a snapshot")
+
     # ----------------------------------------------------------------- commits
     def compact_staging(self) -> None:
         """Rewrite event_staging in seq order.
@@ -390,7 +459,7 @@ class Catalog:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
-            conn.execute("CHECKPOINT")
+            self._checkpoint()
 
     def apply_range(self, start_seq: int, end_seq: int, batch_id: str | None,
                     *, force_checkpoint: bool = False) -> None:
@@ -467,7 +536,7 @@ class Catalog:
                 # Flush the WAL so a kill -9 immediately afterwards still
                 # leaves coherent on-disk state to resume from. Ordinary
                 # commits rely on the WAL itself, which is equally durable.
-                conn.execute("CHECKPOINT")
+                self._checkpoint()
 
     # ------------------------------------------------------------- verification
     def rebuild_mismatch_count(self) -> int:
@@ -505,49 +574,90 @@ class Catalog:
 
     # ----------------------------------------------------------------- queries
     def snapshot_seq(self) -> int:
-        return self.last_snapshot_seq()
+        with self._read_conn() as conn:
+            return _read_snapshot_seq(conn)
 
     def get_shot(self, film_id: str, shot_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT * FROM catalog_current WHERE film_id = ? AND shot_id = ?",
+        with self._read_conn() as conn:
+            cur = conn.execute(
+                f"SELECT {_LISTING_SELECT} FROM catalog_current "
+                "WHERE film_id = ? AND shot_id = ?",
                 [film_id, shot_id],
             )
             row = cur.fetchone()
             if row is None:
                 return None
-            cols = [d[0] for d in cur.description]
-            return _row_to_dict(cols, row)
+            return _row_to_dict(list(LISTING_COLUMNS), row)
+
+    def iter_film_shots(self, film_id: str,
+                        chunk_size: int = LISTING_CHUNK
+                        ) -> Iterator[dict[str, Any]]:
+        """Yield one film's visible shots in one version, in bounded batches.
+
+        ``snapshot_seq``, ``count`` and every shot are read inside ONE explicit
+        read transaction opened before the first chunk, and rows are pulled in
+        key-set pages on ``shot_id``. A commit landing mid-listing is therefore
+        invisible to this listing (it keeps answering the version it started
+        with), while Python holds at most ``chunk_size`` rows and the writer is
+        never blocked by how slowly the consumer drains the iterator.
+
+        Yields the header dict first (``film_id``/``snapshot_seq``/``count``),
+        then the shots.
+        """
+        with self._read_conn() as conn:
+            snapshot = _read_snapshot_seq(conn)
+            count = int(conn.execute(
+                "SELECT count(*) FROM catalog_current WHERE film_id = ?",
+                [film_id],
+            ).fetchone()[0])
+            yield {
+                "film_id": film_id,
+                "snapshot_seq": snapshot,
+                "count": count,
+            }
+            last_shot: str | None = None
+            while True:
+                if last_shot is None:
+                    page = conn.execute(
+                        f"SELECT {_LISTING_SELECT} FROM catalog_current "
+                        "WHERE film_id = ? ORDER BY shot_id LIMIT ?",
+                        [film_id, chunk_size],
+                    ).fetchall()
+                else:
+                    page = conn.execute(
+                        f"SELECT {_LISTING_SELECT} FROM catalog_current "
+                        "WHERE film_id = ? AND shot_id > ? "
+                        "ORDER BY shot_id LIMIT ?",
+                        [film_id, last_shot, chunk_size],
+                    ).fetchall()
+                if not page:
+                    return
+                for row in page:
+                    yield _row_to_dict(list(LISTING_COLUMNS), row)
+                if len(page) < chunk_size:
+                    return
+                last_shot = page[-1][1]
 
     def list_film_shots(self, film_id: str) -> dict[str, Any]:
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT * FROM catalog_current WHERE film_id = ? ORDER BY shot_id",
-                [film_id],
-            )
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-            snapshot = self._conn.execute(
-                "SELECT last_snapshot_seq FROM sync_state WHERE id = 1"
-            ).fetchone()[0]
-            shots = [_row_to_dict(cols, row) for row in rows]
-        return {
-            "film_id": film_id,
-            "snapshot_seq": int(snapshot),
-            "count": len(shots),
-            "shots": shots,
-        }
+        """Whole listing materialized in Python (demos/tests only).
+
+        Production HTTP responses use ``iter_film_shots`` so a hundred
+        thousand shots never sit in one Python list; this helper keeps the
+        plain in-process API convenient and equally snapshot-consistent.
+        """
+        it = self.iter_film_shots(film_id)
+        header = next(it)
+        shots = list(it)
+        return {**header, "shots": shots}
 
     def stats(self) -> dict[str, Any]:
-        with self._lock:
-            staged = self._conn.execute("SELECT count(*), max(seq) FROM event_staging").fetchone()
-            visible = self._conn.execute("SELECT count(*) FROM catalog_current").fetchone()[0]
-            films = self._conn.execute(
+        with self._read_conn() as conn:
+            staged = conn.execute("SELECT count(*), max(seq) FROM event_staging").fetchone()
+            visible = conn.execute("SELECT count(*) FROM catalog_current").fetchone()[0]
+            films = conn.execute(
                 "SELECT count(DISTINCT film_id) FROM catalog_current"
             ).fetchone()[0]
-            snapshot = self._conn.execute(
-                "SELECT last_snapshot_seq FROM sync_state WHERE id = 1"
-            ).fetchone()[0]
+            snapshot = _read_snapshot_seq(conn)
         return {
             "snapshot_seq": int(snapshot),
             "staged_events": int(staged[0]),
@@ -555,6 +665,12 @@ class Catalog:
             "visible_shots": int(visible),
             "films": int(films),
         }
+
+
+def _read_snapshot_seq(conn: duckdb.DuckDBPyConnection) -> int:
+    return int(conn.execute(
+        "SELECT last_snapshot_seq FROM sync_state WHERE id = 1"
+    ).fetchone()[0])
 
 
 def _row_to_dict(cols: list[str], row: tuple) -> dict[str, Any]:

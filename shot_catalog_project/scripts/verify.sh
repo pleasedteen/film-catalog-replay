@@ -10,6 +10,9 @@
 #   3. a cross-page same-batch revision on a 3,000-shot batch (15+ log pages;
 #      scaled down from 100k only to honor the 80s budget). The full 100k case
 #      runs on demand via: python3 -I scripts/demo_large_batch.py
+#   4. streamed film listings: a paused write transaction leaves the published
+#      version visible, and a slow reader does not stall later batch commits
+#      (100k-scale listing on demand: python3 -I scripts/demo_streaming.py).
 #
 # Usage:  scripts/verify.sh
 set -uo pipefail
@@ -27,9 +30,9 @@ fail() { printf "\033[1;31m%s\033[0m\n" "FAILED: $1"; exit 1; }
 cd "$ROOT"
 START=$(date +%s)
 
-section "1/3 automated tests: representative node from every required scenario"
+section "1/4 automated tests: representative node from every required scenario"
 # One focused test per required behavior keeps the run inside the 80s budget;
-# the FULL suite (31 tests) is available anytime via: python3 -I run_tests.py
+# the FULL suite (37 tests) is available anytime via: python3 -I run_tests.py
 "$PY" -I run_tests.py -q \
   tests/test_log_format.py::test_v1_duration_seconds_convert_to_milliseconds \
   tests/test_log_format.py::test_explicit_null_clears_but_still_present \
@@ -42,13 +45,17 @@ section "1/3 automated tests: representative node from every required scenario"
   tests/test_recovery.py::test_reopen_continues_from_durable_prefix \
   tests/test_recovery.py::test_sigkill_then_restart_resumes \
   tests/test_http_api.py::test_shot_and_film_endpoints \
+  tests/test_streaming_listing.py \
   || fail "representative pytest subset"
 
-section "2/3 end-to-end mixed-version demo"
+section "2/4 end-to-end mixed-version demo"
 "$PY" -I scripts/demo.py || fail "mixed-version demo"
 
-section "3/3 cross-page same-batch revision (3,000 shots, 15+ pages)"
+section "3/4 cross-page same-batch revision (3,000 shots, 15+ pages)"
 "$PY" -I scripts/demo_large_batch.py 3000 || fail "large-batch demo"
+
+section "4/4 streamed listings: paused write + slow reader (3,000 shots)"
+"$PY" -I scripts/demo_streaming.py 3000 || fail "streaming demo"
 
 ELAPSED=$(( $(date +%s) - START ))
 printf "\n\033[1;32mALL CHECKS PASSED in %ds (budget 80s)\033[0m\n" "$ELAPSED"

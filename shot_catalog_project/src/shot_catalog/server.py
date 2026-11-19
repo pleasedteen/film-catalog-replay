@@ -14,6 +14,11 @@ GET /film/F
     -> 200 {"film_id", "snapshot_seq", "count", "shots": [...]}
        The whole response is read from one catalog snapshot: a revision
        committing mid-request can never split the answer across two states.
+       The body is sent with ``Transfer-Encoding: chunked`` and encoded shot
+       by shot, so Python buffers one small batch of shots rather than the
+       whole list -- a 100,000-shot film is answered in bounded memory, and a
+       slow client only delays its own connection: sync commits keep landing
+       and later requests already see the newer snapshot.
 
 GET /stats
     -> 200 staging/snapshot counters
@@ -39,6 +44,15 @@ from .sync import LogSourceClient, SyncEngine
 
 log = logging.getLogger("shot_catalog.server")
 
+# Shots encoded into one HTTP chunk of a streamed film listing. Bounds the
+# bytes/serialized objects held per connection (see Catalog.LISTING_CHUNK).
+SHOTS_PER_CHUNK = 64
+
+
+def _encode(payload: dict | list) -> bytes:
+    """One JSON encoding policy for every response (non-ASCII kept readable)."""
+    return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+
 
 def build_handler(catalog: Catalog) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -47,13 +61,79 @@ def build_handler(catalog: Catalog) -> type[BaseHTTPRequestHandler]:
         def log_message(self, *_args):
             pass
 
+        # Set once response headers are on the wire; from then on an error
+        # cannot be turned into a 500 without corrupting the body.
+        _headers_sent = False
+
         def _send(self, code: int, payload: dict | list) -> None:
-            body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+            body = _encode(payload)
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self._headers_sent = True
             self.wfile.write(body)
+
+        def _send_film(self, film_id: str) -> None:
+            """Stream one film listing in bounded chunks from one snapshot.
+
+            The JSON shape is unchanged, including key order, but it is
+            emitted as::
+
+                {"film_id":...,"snapshot_seq":...,"count":...,"shots":[<s1>,<s2>,...]}
+
+            with one HTTP chunk per small batch of shots. Neither memory nor
+            the sync writer scale with the number of shots or with how slowly
+            the client reads. The iterator keeps a single read snapshot open
+            for its lifetime, so the header, ``count`` and every shot come
+            from the same published version.
+            """
+            shots = catalog.iter_film_shots(film_id)
+            try:
+                header = next(shots)
+            except StopIteration:  # pragma: no cover - iterator always yields
+                self._send(500, {"error": "internal error"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self._headers_sent = True
+            head = _encode({
+                "film_id": header["film_id"],
+                "snapshot_seq": header["snapshot_seq"],
+                "count": header["count"],
+            })
+            # Splice the streamed shots into the header object without keeping
+            # a second copy of the opening/closing braces.
+            self._write_chunk(head[:-1] + b', "shots": [')
+            buf: list[bytes] = []
+            first = True
+            try:
+                for shot in shots:
+                    buf.append((b"" if first else b", ") + _encode(shot))
+                    first = False
+                    if len(buf) >= SHOTS_PER_CHUNK:
+                        self._write_chunk(b"".join(buf))
+                        buf.clear()
+                self._write_chunk(b"".join(buf) + b"]}")
+                self._write_chunk(b"")  # terminating zero-length chunk
+            finally:
+                # Releases the read snapshot immediately, even when the
+                # client vanished mid-stream.
+                shots.close()
+
+        def _write_chunk(self, data: bytes) -> None:
+            """Write one HTTP chunk; ``data=b""`` writes the terminating chunk."""
+            self.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
+            if data:
+                self.wfile.write(data)
+            # Every chunk (including the zero-length terminator) ends with
+            # CRLF; the terminator additionally needs the end-of-trailers CRLF.
+            self.wfile.write(b"\r\n")
+            if not data:
+                self.wfile.write(b"\r\n")
+            self.wfile.flush()
 
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
@@ -79,14 +159,27 @@ def build_handler(catalog: Catalog) -> type[BaseHTTPRequestHandler]:
                     if not film_id:
                         self._send(400, {"error": "film_id required"})
                     else:
-                        self._send(200, catalog.list_film_shots(film_id))
+                        self._send_film(film_id)
                 else:
                     self._send(404, {"error": "unknown path"})
             except KeyError:
                 self._send(400, {"error": "missing required query parameter"})
+            except (BrokenPipeError, ConnectionResetError):
+                # Slow/abandoned client: drop this response only. The sync
+                # loop and other connections are unaffected.
+                self.close_connection = True
             except Exception:  # pragma: no cover - defensive
                 log.exception("query failed")
-                self._send(500, {"error": "internal error"})
+                if self._headers_sent:
+                    # A streamed body is already partially delivered; a 500
+                    # would splice JSON-status bytes into it. Abort the
+                    # connection instead (the client sees a truncated body).
+                    self.close_connection = True
+                    return
+                try:
+                    self._send(500, {"error": "internal error"})
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
 
     return Handler
 

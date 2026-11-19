@@ -89,7 +89,7 @@
 | `GET /health` | 健康检查 + 同步统计 |
 | `GET /stats` | 暂存事件数、快照 seq、可见镜头数、影片数 |
 | `GET /shot?film_id=F&shot_id=S` | 查询单个镜头；不存在或撤回中返回 `404` |
-| `GET /film/<film_id>` | 返回该影片**完整镜头清单**，整个响应来自同一个一致快照 |
+| `GET /film/<film_id>` | 返回该影片**完整镜头清单**，整个响应来自同一个一致快照；**分段流式返回**（见 3.3） |
 
 单镜头响应（时长永远是毫秒，修复说明为空时为 `null`）：
 
@@ -108,6 +108,22 @@
 ```json
 {"film_id":"film-a","snapshot_seq":24,"count":3,"shots":[ ... ]}
 ```
+
+### 3.3 影片清单的分段返回（十万镜头）
+
+字段名、字段顺序和镜头排序（`ORDER BY shot_id`）与旧版**完全相同**，客户端无需修改；
+差别只在传输与内存方式：
+
+* 响应使用 `Transfer-Encoding: chunked`，服务端按小批（默认每 HTTP 块 64 条）边读边编码边发送，
+  **Python 端只有有界缓冲**：不会为十万条镜头在内存里聚成一份列表或一份 JSON 字符串
+  （实测 3 个并发的 10 万镜头清单，Python 追踪峰值约 1.4 MB）。
+* 整个清单在一个**只读事务**里读取：`snapshot_seq`、`count`、每一行镜头都属于同一版本。
+  读取中途有新批次提交，这份响应仍停留在它开始时的那一版，绝不会拼出半批
+  （清单里既有旧值也有新值、`count` 与实际条数不符之类）。
+* 读连接与写连接相互独立：写事务暂停在提交中途时，客户端仍先收到**已发布版本**的清单；
+  客户端慢读时，后续批次照常提交并可被其它请求立即看到——慢读只拖慢它自己那条连接。
+
+其它接口（`/shot`、`/health`、`/stats`）保持一次响应一个完整 JSON 体，同样来自一个只读快照。
 
 ---
 
@@ -142,7 +158,18 @@
 每次提交依赖 DuckDB 的 WAL 持久化，批组边界额外 `CHECKPOINT`。进程被 `SIGKILL` 后，
 重启打开同一个文件：`last_snapshot_seq` 指向最后一个完整提交的前缀，同步器从该前缀附近重新拉页
 （重复投递本就幂等），继续追赶。已保存进度与查询结果始终对应同一段完整历史。
-恢复过程中查询服务继续响应；每个请求在单一连接的锁内读到一个一致快照。
+恢复过程中查询服务继续响应；每个请求用独立只读连接开启显式只读事务，读到一个一致快照。
+若慢读客户端仍持有快照导致 `CHECKPOINT` 暂时无法执行，它只是被推迟（提交已在 WAL 中持久），
+不会让同步失败，下次提交会再试。
+
+### 读写隔离
+
+写路径（暂存、提交、组边界 `CHECKPOINT`）走唯一一条写连接并由锁保护；查询路径**不共享**写连接，
+而是每次请求新开一条只读连接并钉住一个显式只读事务。因此：
+
+* 写事务暂停在提交中途时，查询看到的是**上一个已发布版本**，不会看到未提交改动；
+* 查询再慢也不会阻塞写提交，后续批次照常推进；
+* 单个影片清单的 `snapshot_seq`／`count`／镜头列表在同一个只读事务内取值，天然同版本。
 
 ---
 
@@ -167,8 +194,9 @@ shot_catalog_project/
 │   ├── verify.sh                # 一键验证（80 秒预算）
 │   ├── demo.py                  # 混合版本端到端演示
 │   ├── demo_large_batch.py      # 跨页十万级同批修订演示
+│   ├── demo_streaming.py        # 暂停写入 + 慢读客户端的流式清单演示
 │   └── _sync_worker.py          # 恢复测试用的一次性同步 worker
-└── tests/                       # 31 个自动化测试
+└── tests/                       # 37 个自动化测试
 ```
 
 ---
@@ -189,8 +217,9 @@ scripts/bootstrap.sh            # 安装 duckdb==2.0.0 与 pytest==9.2.0
 scripts/verify.sh
 ```
 
-它会运行覆盖全部必需场景的代表性测试、混合版本演示、跨页同批修订演示，并打印可读的分节结果。
-完整 31 项测试可随时单独运行：
+它会运行覆盖全部必需场景的代表性测试、混合版本演示、跨页同批修订演示，以及
+“暂停写入 + 慢读客户端”的流式清单演示，并打印可读的分节结果。
+完整 37 项测试可随时单独运行：
 
 ```bash
 python3 -I run_tests.py -q
@@ -218,6 +247,8 @@ curl -s 'http://127.0.0.1:8080/stats'
 python3 -I scripts/demo.py                    # 混合版本/撤回/恢复，小而全
 python3 -I scripts/demo_large_batch.py        # 完整十万镜头同批修订
 python3 -I scripts/demo_large_batch.py 3000   # 缩小规模快速演示
+python3 -I scripts/demo_streaming.py          # 十万镜头清单：暂停写入 + 慢读
+python3 -I scripts/demo_streaming.py 3000     # 缩小规模快速演示
 ```
 
 ### 6.6 终止后恢复（手动演示）
@@ -240,6 +271,9 @@ python3 -I scripts/_sync_worker.py run/catalog.duckdb http://127.0.0.1:8081 100 
 | 跨页大批修订的原子性 | `test_batch_atomicity.py`（半批不可见、整批一次可见、跨 15+ 页） |
 | 终止后恢复 | `test_reopen_continues_from_durable_prefix`、`test_sigkill_then_restart_resumes`（真实子进程 SIGKILL） |
 | 同步期间查询一致 | `test_http_api.py::test_concurrent_reads_while_syncing`、`test_film_listing_is_one_consistent_snapshot` |
+| 清单分段返回、有界缓冲 | `test_streaming_listing.py::test_film_listing_is_streamed_and_snapshot_consistent`、`test_listing_is_read_in_bounded_chunks`、`test_http_chunks_are_bounded_and_independent_of_film_size` |
+| 写事务暂停时仍返回已发布版本 | `test_streaming_listing.py::test_paused_write_transaction_still_serves_published_version`、`test_paused_writer_does_not_block_new_commits_from_other_batches` |
+| 慢读客户端不阻塞后续批次提交 | `test_streaming_listing.py::test_slow_reader_does_not_stall_sync`（同一版本、后续批次可见） |
 
 夹具（`fixturegen.py`）是真实生成的提交历史：v1 与 v2 记录交错修订同一批镜头、
 携带真实不同的秒/毫秒字段与修复说明，而不是给日志贴不同版本标签。
