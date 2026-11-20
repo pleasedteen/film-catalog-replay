@@ -224,3 +224,77 @@ def write_tiny_history(path: str | Path) -> dict[str, Any]:
         seq = _emit(fh, seq, "upsert", "f1", "a", 1,
                     {"description": None, "duration_sec": 3})
     return {"path": str(path), "total_events": seq - 1}
+
+
+def generate_sparse_history(path: str | Path, n_unsubscribed: int = 4000,
+                            batch_across: int = 600) -> dict[str, Any]:
+    """History with a big unsubscribed film amid subscribed films.
+
+    Layout (gapless seq):
+      * ``film-sub-a`` / ``film-sub-b``: a few shots, revised in place;
+      * ``film-skip``: ``n_unsubscribed`` ordinary revisions of one shot with
+        distinct payloads -- if a sparse reader transferred them, its volume
+        would grow linearly with this number;
+      * a same-batch revision ``B700`` that revises a shot of ``film-sub-a``
+        and a shot of ``film-skip`` back-to-back (so the batch is cross-film:
+        publishing it for the subscribed film must NOT require the unsubscribed
+        film's records);
+      * ``film-late``: a film whose events start only *after* the subscribed
+        films were already published -- the case a late (append) subscription
+        backfills;
+      * a trailing ordinary revision of ``film-skip`` after the batch.
+    The returned summary lists exact seqs so tests can reason about windows.
+    """
+    path = Path(path)
+    seq = 1
+    with path.open("w", encoding="utf-8") as fh:
+        # Early subscriber history.
+        for i, (shot, ms) in enumerate((("A001", 1000), ("A002", 2000)), start=1):
+            seq = _emit(fh, seq, "upsert", "film-sub-a", shot, 2,
+                        {"title": f"A-{shot}", "duration_ms": ms})
+        seq = _emit(fh, seq, "upsert", "film-sub-b", "B001", 1,
+                    {"title": "B-1", "duration_sec": 3})
+        # Bulk ordinary churn on the unsubscribed film.
+        skip_start = seq
+        for i in range(n_unsubscribed):
+            seq = _emit(fh, seq, "upsert", "film-skip", "SK001", 2,
+                        {"title": f"skip-{i}", "duration_ms": 5000 + i})
+        skip_end = seq - 1
+        # Cross-film same-batch revision: subscribed shot first, then skipped.
+        batch_start = seq
+        seq = _emit(fh, seq, "upsert", "film-sub-a", "A001", 2,
+                    {"duration_ms": 1250, "repair_note": "cross-batch"},
+                    batch_id="B700")
+        for i in range(batch_across - 1):
+            seq = _emit(fh, seq, "upsert", "film-skip", "SK001", 2,
+                        {"title": f"skip-batch-{i}", "duration_ms": 7000 + i},
+                        batch_id="B700")
+        seq = _emit(fh, seq, "upsert", "film-sub-b", "B001", 2,
+                    {"duration_ms": 3250}, batch_id="B700")
+        batch_end = seq - 1
+        # Trailing revision of an unsubscribed shot after the batch.
+        seq = _emit(fh, seq, "upsert", "film-skip", "SK001", 2,
+                    {"title": "skip-tail", "duration_ms": 9999})
+        # Late film: appears only now, so an append subscription must backfill.
+        late_start = seq
+        for shot, ms in (("L001", 800), ("L002", 900)):
+            seq = _emit(fh, seq, "upsert", "film-late", shot, 2,
+                        {"title": f"late-{shot}", "duration_ms": ms})
+        late_end = seq - 1
+    return {
+        "path": str(path),
+        "total_events": seq - 1,
+        "skip": {"start_seq": skip_start, "end_seq": skip_end},
+        "batch": {"id": "B700", "start_seq": batch_start, "end_seq": batch_end},
+        "late": {"start_seq": late_start, "end_seq": late_end},
+        "subscribed": ["film-sub-a", "film-sub-b"],
+        "expected": {
+            "film-sub-a": {
+                "A001": {"duration_ms": 1250, "repair_note": "cross-batch"},
+                "A002": {"duration_ms": 2000, "repair_note": None},
+            },
+            "film-sub-b": {"B001": {"duration_ms": 3250}},
+            "film-late": {"L001": {"duration_ms": 800},
+                          "L002": {"duration_ms": 900}},
+        },
+    }

@@ -82,6 +82,43 @@ def test_missing_param_is_400(synced):
         httpd.shutdown()
 
 
+def test_subscription_endpoints(catalog):
+    """GET lists subscriptions; POST appends one as backfilling."""
+    httpd, base = _start(catalog)
+    try:
+        code, body = _get(base, "/subscriptions")
+        assert code == 200
+        assert body["films"] == [] and body["sparse"] is False
+
+        import urllib.request
+        req = urllib.request.Request(
+            base + "/subscriptions",
+            data=json.dumps({"film_id": "film-a"}).encode("utf-8"),
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            created = json.loads(resp.read().decode("utf-8"))
+        assert created["film_id"] == "film-a"
+        # Nothing published yet, so the first subscription joins as active.
+        assert created["status"] == "active"
+
+        code, body = _get(base, "/subscriptions")
+        assert body["sparse"] is True
+        assert body["films"][0]["film_id"] == "film-a"
+        assert body["films"][0]["status"] == "active"
+
+        # Missing film_id is a 400.
+        bad = urllib.request.Request(base + "/subscriptions", data=b"{}",
+                                     method="POST")
+        try:
+            urllib.request.urlopen(bad, timeout=10)
+            assert False, "expected 400"
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+    finally:
+        httpd.shutdown()
+
+
 def test_concurrent_reads_while_syncing(catalog, mixed_summary):
     """Queries keep responding with consistent snapshots during sync."""
     from shot_catalog.log_store import PagedLogSource, serve

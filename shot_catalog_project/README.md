@@ -109,6 +109,33 @@
 {"film_id":"film-a","snapshot_seq":24,"count":3,"shots":[ ... ]}
 ```
 
+### 3.3 稀疏订阅（只同步订阅的影片）
+
+片库变大后，数仓往往只关心一批订阅影片。给查询服务传入 `--subscribe`（或调用
+`POST /subscriptions`）即可进入**稀疏模式**：分页请求只请求所选影片的镜头事件，
+未订阅影片的普通修订再多，**传输量也不随片库线性增长**；而全局快照号照常推进，
+越过整段未订阅历史。
+
+| 方法/路径 | 说明 |
+| --- | --- |
+| `GET /subscriptions` | 列出订阅及其状态（`active` / `backfill`）与回补进度 |
+| `POST /subscriptions` `{"film_id":"film-c"}` | 追加订阅一部影片，返回 `active`（初始订阅）或 `backfill`（追加） |
+
+`GET /logs` 支持 `&films=F1,F2`：`records` 只含这些影片的镜头事件，但 `total` /
+`has_more` 仍是全局窗口；响应另带 `batch_runs`，给出与窗口相交的每个同批修订的
+**完整序号范围**（跨片批次不必传输未订阅部分也能整批发布）。
+
+稀疏语义（实现见 `sync.py` 的 `_commit_sparse_groups` / `_backfill_step`）：
+
+* **全局快照照常推进**：`sync_state.resolved_seq` 是取数水位（含被主动跳过的未订阅
+  `seq`），`last_snapshot_seq` 随之越过它们；
+* **跨片批次整批可见**：同批修订对已订阅影片以一个原子组发布，未订阅的其余记录
+  永不传输；
+* **追加订阅只回补新影片**：新影片以 `backfill` 状态从自己的历史起点回补到**当初的
+  发布版本**，补齐后才翻为 `active`，并与老订阅处于同一发布版本；老订阅继续正常发布；
+* **回补可中断续跑**：每回补一个窗口即持久化 `backfill_fetch_seq/backfilled_seq`，
+  重启从已完成进度继续，且未完成的影片始终不可查询。
+
 ---
 
 ## 4. 目录如何在 DuckDB 中保持正确（核心设计）
@@ -117,9 +144,15 @@
 
 * `event_staging`：归一化后的原始事件，按 `seq` 主键去重。页内重复在 Python 折叠（仅缓冲当前一页），
   跨页重复用基于主键的 anti-join 丢弃；是一条纯追加的高吞吐路径，**从不在 Python 里聚齐整批日志**。
+  稀疏模式下只暂存订阅影片的 `seq`，未订阅 `seq` 不落库。
 * `shot_state`：每个镜头一行的当前状态（含 `withdrawn` 标志）。
-* `catalog_current`：`shot_state WHERE NOT withdrawn` 的视图，撤回即从所有查询中消失，重新发布即恢复。
-* `sync_state`：单行进度指针 `last_snapshot_seq`。
+* `catalog_current`：`shot_state WHERE NOT withdrawn` 且属于 `active` 订阅影片的视图；
+  撤回即消失，重新发布即恢复，仍在 `backfill` 的影片不可查询。订阅表为空时退化为
+  “同步所有影片”的原始行为。
+* `sync_state`：单行进度。`last_snapshot_seq` 是可查询的发布前缀，`resolved_seq` 是取数
+  水位（含主动跳过的未订阅 `seq`），恒有 `resolved_seq >= last_snapshot_seq`。
+* `film_subscriptions`：稀疏订阅及其回补进度（`backfill_fetch_seq` / `backfilled_seq`）。
+* `batch_extents`：同批修订的完整范围，由源端在相交分页中顺带告知，使跨片批次可整批发布。
 
 **提交组（commit group）**：普通记录各自成组（连续普通记录会合并刷盘以减少事务数）；
 共享 `batch_id` 的连续记录构成**一个原子组**。一个组只有在其整段连续 `seq` 都已持久暂存、
@@ -167,8 +200,9 @@ shot_catalog_project/
 │   ├── verify.sh                # 一键验证（80 秒预算）
 │   ├── demo.py                  # 混合版本端到端演示
 │   ├── demo_large_batch.py      # 跨页十万级同批修订演示
+│   ├── demo_sparse_subscription.py  # 稀疏订阅 / 跨片批次 / 回补中断演示
 │   └── _sync_worker.py          # 恢复测试用的一次性同步 worker
-└── tests/                       # 31 个自动化测试
+└── tests/                       # 39 个自动化测试
 ```
 
 ---
@@ -189,8 +223,9 @@ scripts/bootstrap.sh            # 安装 duckdb==2.0.0 与 pytest==9.2.0
 scripts/verify.sh
 ```
 
-它会运行覆盖全部必需场景的代表性测试、混合版本演示、跨页同批修订演示，并打印可读的分节结果。
-完整 31 项测试可随时单独运行：
+脚本会运行覆盖全部必需场景的代表性测试（含稀疏订阅）、混合版本演示、跨页同批修订演示，
+以及稀疏订阅演示（传输量恒定、跨片批次、追加回补与中断续跑），并打印可读的分节结果。
+完整 39 项测试可随时单独运行：
 
 ```bash
 python3 -I run_tests.py -q
@@ -212,15 +247,31 @@ curl -s 'http://127.0.0.1:8080/film/film-a'
 curl -s 'http://127.0.0.1:8080/stats'
 ```
 
-### 6.5 可复跑演示
+### 6.5 稀疏订阅（只同步订阅影片）
+
+```bash
+# 启动时只订阅 film-a、film-b（否则同步全部影片）
+SUBSCRIBE=film-a,film-b scripts/start_service.sh
+# 也可直接给查询服务传 --subscribe
+python3 -I scripts/run_module.py shot_catalog.server --db run/catalog.duckdb \
+  --log-source-url http://127.0.0.1:8081 --subscribe film-a,film-b
+
+# 运行中追加订阅一部影片（新影片先 backfill，补齐后 active 才可查询）
+curl -s -X POST http://127.0.0.1:8080/subscriptions \
+  -d '{"film_id":"film-c"}'
+curl -s http://127.0.0.1:8080/subscriptions      # 查看状态与回补进度
+```
+
+### 6.6 可复跑演示
 
 ```bash
 python3 -I scripts/demo.py                    # 混合版本/撤回/恢复，小而全
 python3 -I scripts/demo_large_batch.py        # 完整十万镜头同批修订
 python3 -I scripts/demo_large_batch.py 3000   # 缩小规模快速演示
+python3 -I scripts/demo_sparse_subscription.py  # 稀疏订阅/跨片批次/回补中断
 ```
 
-### 6.6 终止后恢复（手动演示）
+### 6.7 终止后恢复（手动演示）
 
 ```bash
 # 直接对同一个 db 文件反复运行 worker；中途 Ctrl-C / kill 后再次运行即可续跑
@@ -240,6 +291,11 @@ python3 -I scripts/_sync_worker.py run/catalog.duckdb http://127.0.0.1:8081 100 
 | 跨页大批修订的原子性 | `test_batch_atomicity.py`（半批不可见、整批一次可见、跨 15+ 页） |
 | 终止后恢复 | `test_reopen_continues_from_durable_prefix`、`test_sigkill_then_restart_resumes`（真实子进程 SIGKILL） |
 | 同步期间查询一致 | `test_http_api.py::test_concurrent_reads_while_syncing`、`test_film_listing_is_one_consistent_snapshot` |
+| 稀疏订阅：只传所选影片、传输量恒定 | `test_sparse_subscription.py::test_only_subscribed_films_are_transferred`、`test_transferred_volume_is_flat_across_library_size` |
+| 全局快照越过未订阅历史 | `test_global_snapshot_advances_past_unsubscribed_history` |
+| 跨片同批修订整批可见 | `test_cross_film_batch_publishes_subscribed_survivors_atomically` |
+| 追加订阅只回补新影片、同发布版本可查 | `test_append_subscription_backfills_only_the_new_film`、`test_new_film_hidden_until_backfill_completes` |
+| 回补中断续跑 | `test_backfill_interrupt_resumes_from_durable_progress` |
 
 夹具（`fixturegen.py`）是真实生成的提交历史：v1 与 v2 记录交错修订同一批镜头、
 携带真实不同的秒/毫秒字段与修复说明，而不是给日志贴不同版本标签。

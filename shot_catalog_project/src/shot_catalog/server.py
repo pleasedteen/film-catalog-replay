@@ -63,6 +63,11 @@ def build_handler(catalog: Catalog) -> type[BaseHTTPRequestHandler]:
                     self._send(200, {"status": "ok", **catalog.stats()})
                 elif parsed.path == "/stats":
                     self._send(200, catalog.stats())
+                elif parsed.path == "/subscriptions":
+                    self._send(200, {
+                        "films": catalog.subscription_rows(),
+                        "sparse": catalog.has_subscriptions(),
+                    })
                 elif parsed.path == "/shot":
                     film_id = qs["film_id"][0]
                     shot_id = qs["shot_id"][0]
@@ -88,6 +93,28 @@ def build_handler(catalog: Catalog) -> type[BaseHTTPRequestHandler]:
                 log.exception("query failed")
                 self._send(500, {"error": "internal error"})
 
+        def do_POST(self):  # noqa: N802
+            parsed = urlparse(self.path)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                body = self.rfile.read(length) if length else b"{}"
+                payload = json.loads(body.decode("utf-8") or "{}")
+                if parsed.path == "/subscriptions":
+                    film_id = payload.get("film_id")
+                    if not isinstance(film_id, str) or not film_id:
+                        self._send(400, {"error": "film_id required"})
+                        return
+                    status = catalog.add_subscription(film_id)
+                    self._send(200, {"film_id": film_id, "status": status,
+                                     "subscriptions": catalog.subscription_rows()})
+                else:
+                    self._send(404, {"error": "unknown path"})
+            except (ValueError, json.JSONDecodeError):
+                self._send(400, {"error": "invalid JSON body"})
+            except Exception:  # pragma: no cover - defensive
+                log.exception("subscription request failed")
+                self._send(500, {"error": "internal error"})
+
     return Handler
 
 
@@ -95,8 +122,13 @@ class ShotCatalogService:
     """Owns the catalog, optional sync thread and HTTP server."""
 
     def __init__(self, db_path: str | Path, log_source_url: str | None = None,
-                 *, page_size: int = 100, poll_interval: float = 0.15):
+                 *, page_size: int = 100, poll_interval: float = 0.15,
+                 subscribe: list[str] | None = None):
         self.catalog = Catalog(db_path)
+        # Seed subscriptions before the sync thread starts so its first pass
+        # only transfers the films the warehouse asked for.
+        for film in subscribe or []:
+            self.catalog.add_subscription(film)
         self.engine: SyncEngine | None = None
         self._sync_thread: threading.Thread | None = None
         if log_source_url:
@@ -153,6 +185,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll-interval", type=float, default=0.15)
     parser.add_argument("--runtime-json", default=None,
                         help="Write the actual listening port here (for demos/tests)")
+    parser.add_argument("--subscribe", default=None,
+                        help="Comma-separated film ids to sync (sparse mode). "
+                             "Omit to sync every film in the source history.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -160,9 +195,11 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    subscribe = [f for f in (args.subscribe or "").split(",") if f]
     service = ShotCatalogService(
         args.db, args.log_source_url,
         page_size=args.page_size, poll_interval=args.poll_interval,
+        subscribe=subscribe,
     )
     service.serve(args.host, args.port, runtime_json=args.runtime_json)
     return 0

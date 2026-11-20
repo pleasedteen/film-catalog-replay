@@ -5,6 +5,10 @@
 #   2. the shot catalog query service, which also runs the sync loop against #1
 #
 # Usage: scripts/start_service.sh [history.jsonl] [db.duckdb]
+#
+# Sparse mode (sync only some films) via the SUBSCRIBE env var, comma-separated:
+#   SUBSCRIBE=film-a,film-b scripts/start_service.sh
+# With no SUBSCRIBE, every film in the history is synced (original behavior).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,9 +44,14 @@ python3 -I "$HERE/run_module.py" shot_catalog.log_store "$HISTORY" \
 LOG_PID=$!
 
 echo "starting query service on :$QUERY_PORT (db=$DB)"
+SUBSCRIBE_ARGS=()
+if [ -n "${SUBSCRIBE:-}" ]; then
+  SUBSCRIBE_ARGS=(--subscribe "$SUBSCRIBE")
+  echo "sparse mode: subscribing to $SUBSCRIBE"
+fi
 python3 -I "$HERE/run_module.py" shot_catalog.server --db "$DB" \
   --log-source-url "http://127.0.0.1:$LOG_PORT" \
-  --port "$QUERY_PORT" --page-size 100 --verbose &
+  --port "$QUERY_PORT" --page-size 100 --verbose "${SUBSCRIBE_ARGS[@]}" &
 SERVER_PID=$!
 
 trap 'kill "$LOG_PID" "$SERVER_PID" 2>/dev/null || true' EXIT INT TERM

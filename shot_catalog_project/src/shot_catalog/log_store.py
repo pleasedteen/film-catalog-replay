@@ -19,12 +19,21 @@ GET /health
 GET /meta
     -> {"total": N, "page_size_hint": P, "path": ...}
 
-GET /logs?offset=0&limit=100
+GET /logs?offset=0&limit=100[&films=F1,F2]
     -> 200 {"offset": o, "limit": l, "total": N, "has_more": bool,
-            "records": [ <raw source record JSON objects>, ... ]}
-       Records belong to seq range [o+1, o+l] (clipped to total), possibly
-       shuffled and duplicated. The true seq order is recoverable from each
-       record's "seq" field.
+            "returned": R, "records": [ ... ],
+            "batch_runs": [ {"batch_id": B, "start_seq": s, "end_seq": e}, ... ]}
+       The window is the *global* record range [o+1, o+l] (clipped to total).
+       When ``films`` is supplied, ``records`` carries only those films' shot
+       events: unrelated ordinary revisions never cross the wire, so transferred
+       bytes track the subscription rather than the whole library. ``total`` and
+       ``has_more`` stay global so a sparse reader still advances its global
+       snapshot.
+       ``batch_runs`` reports the FULL extent of every same-batch revision that
+       intersects the global window, regardless of the film filter. A sparse
+       reader needs it to publish a cross-film batch atomically for subscribed
+       films without ever transferring the unsubscribed remainder.
+       Records may be shuffled/duplicated as described above.
     -> 500 {"error": "transient delivery failure"} on simulated failures.
 
 GET /raw?seq=K
@@ -64,6 +73,11 @@ class PagedLogSource:
         self._rng = random.Random(seed)
         self._lock = threading.Lock()
         self._records: list[dict] = []
+        # Controller state for "the log keeps growing while a client syncs"
+        # and for a new film that only appears partway through a history.
+        # ``visible_total`` is what /health and /logs currently expose.
+        self._visible_total: int | None = None
+        self._published_films: set[str] = set()
         self._build_index()
 
     def _build_index(self) -> None:
@@ -72,21 +86,67 @@ class PagedLogSource:
                 line = line.strip()
                 if line:
                     self._records.append(json.loads(line))
+        # Whole-history batch extents: a batch's run is contiguous by the
+        # format contract, so the first/last seq per batch_id is its extent.
+        runs: dict[str, list[int]] = {}
+        for rec in self._records:
+            bid = rec.get("batch_id")
+            if bid is None:
+                continue
+            seq = int(rec["seq"])
+            span = runs.get(bid)
+            if span is None:
+                runs[bid] = [seq, seq]
+            else:
+                span[0] = min(span[0], seq)
+                span[1] = max(span[1], seq)
+        self._batch_extents = {
+            bid: (span[0], span[1]) for bid, span in runs.items()
+        }
+        # List of (start_seq, end_seq, batch_id) used for range overlap lookups.
+        self._batch_spans = [
+            (start, end, bid) for bid, (start, end) in self._batch_extents.items()
+        ]
 
     @property
     def total(self) -> int:
-        return len(self._records)
+        """Currently exposed record count (may grow during a sync demo)."""
+        if self._visible_total is None:
+            return len(self._records)
+        return min(self._visible_total, len(self._records))
+
+    def set_visible_total(self, n: int) -> None:
+        """Simulate the source log growing: /health and /logs stop at ``n``."""
+        self._visible_total = max(0, min(n, len(self._records)))
+
+    def reveal_all(self) -> None:
+        self._visible_total = None
 
     def read_record(self, seq: int) -> dict:
-        if not 1 <= seq <= len(self._records):
+        if not 1 <= seq <= self.total:
             raise IndexError(seq)
         return self._records[seq - 1]
 
-    def serve_page(self, offset: int, limit: int) -> dict:
-        """Return one messy page covering source rows [offset, offset+limit)."""
+    def batch_runs_in(self, start_seq: int, end_seq: int) -> list[dict]:
+        """Full extents of batches intersecting [start_seq, end_seq]."""
+        out = []
+        for bstart, bend, bid in self._batch_spans:
+            if bstart <= end_seq and bend >= start_seq:
+                out.append({"batch_id": bid, "start_seq": bstart, "end_seq": bend})
+        return out
+
+    def serve_page(self, offset: int, limit: int,
+                   films: set[str] | None = None) -> dict:
+        """Return one messy page covering source rows [offset, offset+limit).
+
+        ``films`` (optional) restricts the *records* to those films without
+        changing the global window, total or has_more: sparse consumers still
+        advance their global snapshot while only subscribed shot events cross
+        the wire. Batch extents are always reported over the whole window.
+        """
         if offset < 0 or limit <= 0:
             raise ValueError("offset must be >= 0 and limit > 0")
-        total = len(self._records)
+        total = self.total
         clipped = min(limit, total - offset)
         seqs = list(range(offset + 1, offset + 1 + max(clipped, 0)))
         with self._lock:
@@ -103,6 +163,8 @@ class PagedLogSource:
             if self.shuffle and len(duplicated) > 1:
                 self._rng.shuffle(duplicated)
         records = [self._records[s - 1] for s in duplicated]
+        if films is not None:
+            records = [r for r in records if r.get("film_id") in films]
         return {
             "offset": offset,
             "limit": limit,
@@ -110,6 +172,7 @@ class PagedLogSource:
             "total": total,
             "has_more": offset + clipped < total,
             "records": records,
+            "batch_runs": self.batch_runs_in(offset + 1, offset + max(clipped, 0)),
         }
 
 
@@ -145,8 +208,12 @@ def build_handler(source: PagedLogSource) -> type[BaseHTTPRequestHandler]:
                 elif parsed.path == "/logs":
                     offset = int(qs.get("offset", ["0"])[0])
                     limit = int(qs.get("limit", [str(source.page_size_hint)])[0])
+                    films_raw = qs.get("films", [None])[0]
+                    films = None
+                    if films_raw is not None:
+                        films = {f for f in films_raw.split(",") if f}
                     try:
-                        page = source.serve_page(offset, limit)
+                        page = source.serve_page(offset, limit, films=films)
                     except TransientLogError as exc:
                         self._send(500, {"error": str(exc)})
                         return
