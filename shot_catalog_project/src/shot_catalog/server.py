@@ -35,7 +35,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .catalog import Catalog
-from .sync import LogSourceClient, SyncEngine
+from .sync import LogSourceClient, SyncEngine, make_archiver
 
 log = logging.getLogger("shot_catalog.server")
 
@@ -63,6 +63,21 @@ def build_handler(catalog: Catalog) -> type[BaseHTTPRequestHandler]:
                     self._send(200, {"status": "ok", **catalog.stats()})
                 elif parsed.path == "/stats":
                     self._send(200, catalog.stats())
+                elif parsed.path == "/cold/status":
+                    stats = catalog.stats()
+                    if not stats["cold_enabled"]:
+                        self._send(200, {"enabled": False})
+                    else:
+                        body = {
+                            "enabled": True,
+                            "available": stats["cold_available"],
+                            "segments": stats["cold_segments"],
+                            "cold_events": stats["cold_events"],
+                            "archived_through_seq": stats["archived_through_seq"],
+                            "hot_published_backlog_groups":
+                                catalog.hot_published_group_count(),
+                        }
+                        self._send(200, body)
                 elif parsed.path == "/shot":
                     film_id = qs["film_id"][0]
                     shot_id = qs["shot_id"][0]
@@ -95,15 +110,22 @@ class ShotCatalogService:
     """Owns the catalog, optional sync thread and HTTP server."""
 
     def __init__(self, db_path: str | Path, log_source_url: str | None = None,
-                 *, page_size: int = 100, poll_interval: float = 0.15):
-        self.catalog = Catalog(db_path)
+                 *, page_size: int = 100, poll_interval: float = 0.15,
+                 cold_dir: str | Path | None = None,
+                 cold_archive_rows: int = 5000):
+        self.catalog = Catalog(db_path, cold=cold_dir)
         self.engine: SyncEngine | None = None
         self._sync_thread: threading.Thread | None = None
         if log_source_url:
             client = LogSourceClient(log_source_url)
+            archiver = None
+            if self.catalog.cold is not None:
+                archiver = make_archiver(self.catalog,
+                                         target_rows=cold_archive_rows)
             self.engine = SyncEngine(self.catalog, client,
                                      page_size=page_size,
-                                     poll_interval=poll_interval)
+                                     poll_interval=poll_interval,
+                                     archiver=archiver)
         self.httpd: ThreadingHTTPServer | None = None
 
     def start_sync(self) -> None:
@@ -151,6 +173,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--poll-interval", type=float, default=0.15)
+    parser.add_argument("--cold-dir", default=None,
+                        help="Enable hot/cold separation: published history is "
+                             "archived into this independent cold directory.")
+    parser.add_argument("--cold-archive-rows", type=int, default=5000,
+                        help="Target rows per cold Parquet segment.")
     parser.add_argument("--runtime-json", default=None,
                         help="Write the actual listening port here (for demos/tests)")
     parser.add_argument("--verbose", action="store_true")
@@ -163,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
     service = ShotCatalogService(
         args.db, args.log_source_url,
         page_size=args.page_size, poll_interval=args.poll_interval,
+        cold_dir=args.cold_dir, cold_archive_rows=args.cold_archive_rows,
     )
     service.serve(args.host, args.port, runtime_json=args.runtime_json)
     return 0

@@ -33,6 +33,14 @@ fi
 
 LOG_PORT="${LOG_PORT:-8081}"
 QUERY_PORT="${QUERY_PORT:-8080}"
+# When COLD_DIR is set, published history is archived into that independent
+# cold directory while the service runs (default: hot-only, legacy behavior).
+COLD_ARGS=()
+if [ -n "${COLD_DIR:-}" ]; then
+  mkdir -p "$COLD_DIR"
+  COLD_ARGS=(--cold-dir "$COLD_DIR" --cold-archive-rows "${COLD_ARCHIVE_ROWS:-5000}")
+  echo "cold archive enabled: $COLD_DIR"
+fi
 
 echo "starting log source on :$LOG_PORT serving $HISTORY"
 python3 -I "$HERE/run_module.py" shot_catalog.log_store "$HISTORY" \
@@ -42,7 +50,7 @@ LOG_PID=$!
 echo "starting query service on :$QUERY_PORT (db=$DB)"
 python3 -I "$HERE/run_module.py" shot_catalog.server --db "$DB" \
   --log-source-url "http://127.0.0.1:$LOG_PORT" \
-  --port "$QUERY_PORT" --page-size 100 --verbose &
+  --port "$QUERY_PORT" --page-size 100 --verbose "${COLD_ARGS[@]}" &
 SERVER_PID=$!
 
 trap 'kill "$LOG_PID" "$SERVER_PID" 2>/dev/null || true' EXIT INT TERM

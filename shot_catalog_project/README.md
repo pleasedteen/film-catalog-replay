@@ -86,8 +86,9 @@
 
 | 方法/路径 | 说明 |
 | --- | --- |
-| `GET /health` | 健康检查 + 同步统计 |
-| `GET /stats` | 暂存事件数、快照 seq、可见镜头数、影片数 |
+| `GET /health` | 健康检查 + 同步统计（含 `cold_available`、`cold_segments` 等冷端字段） |
+| `GET /stats` | 暂存事件数、快照 seq、可见镜头数、影片数、冷端归档统计 |
+| `GET /cold/status` | 冷端开关、可用性、段数量、已归档水位与热端积压提交组数（未启用冷端时返回 `{"enabled": false}`） |
 | `GET /shot?film_id=F&shot_id=S` | 查询单个镜头；不存在或撤回中返回 `404` |
 | `GET /film/<film_id>` | 返回该影片**完整镜头清单**，整个响应来自同一个一致快照 |
 
@@ -137,6 +138,35 @@
 测试里还内置了一个独立的“全前缀重建” oracle（`rebuild_mismatch_count`），
 用另一条 SQL 路径从全部暂存事件重算目录，与增量状态逐行比对，应为 0。
 
+### 热库 / 冷库分层（已发布历史的独立冷文件）
+
+已发布（`seq <= last_snapshot_seq`）的提交历史可以从热 DuckDB 迁到一个**可独立
+维护的冷目录**（`src/shot_catalog/cold.py` + `Catalog.archive_published_prefix`）：
+
+* **冷端形态**：冷目录里只有 `manifest.json`（清单）和 `segments/seg-*.parquet`
+  （不可变段文件），可以脱离热库单独备份、搬移或用任意 Parquet 工具查看；热库里的
+  `cold_archive_state` 表是“哪些 seq 已归档”的权威索引，清单与段文件都能由它重建。
+* **迁移期间水位与目录不变**：归档只搬运发布水位以下的行，`sync_state`
+  的发布水位、热库目录结构、`shot_state` 查询结果全程不变；**未发布数据仍能正常
+  暂存与提交**，归档永远不会碰到水位之上的行。同批（batch）修订不会被拆到两个段里。
+* **归档与查询时目录可查**：热+冷通过 `event_history` 视图
+  （热行按 seq 遮蔽冷行）拼成完整历史，`rebuild_mismatch_count` 与
+  `verify_full_history_oracle` 都能在归档后重建并核对整个目录；在线查询只读热端
+  `shot_state`，不依赖冷端。
+* **冷端故障的背压**：冷端不可用时，在线查询照常服务；同步器最多允许**一个新发布的
+  提交组**积压在热库，随后**暂停翻页**与后续发布（`/cold/status` 可查积压组数与
+  冷端可用性）。冷端恢复后积压自动追赶排空，无需人工介入。
+* **旧页重投只查热端**：已归档页的重复投递只会回到热 `event_staging`
+  （基于主键的 anti-join 去重），冷段不会被改写；内容与 Parquet 副本核对一致后由
+  `_reclaim_shadowed_hot_rows` 回收，热库回到最小工作集。
+* **段写入的崩溃安全**：先 COPY 到 `*.tmp` 并读回校验行数/seq 区间/指纹，再改名、
+  再在**一个事务**里删热行+写状态表并 CHECKPOINT，最后原子重写清单。重开时
+  `reconcile` 自动清理 tmp/孤儿段、重建缺失清单；若已提交段文件丢失则把冷端标记
+  离线，热端查询不受影响。
+* **关闭日志源后的本地重建**：`export_history_jsonl` 把热+冷完整历史导出成本地
+  JSONL；新库用 `load_jsonl_history`（走归一化暂存记录解析，不依赖 HTTP）即可
+  重放提交组并核对目录，全程不需要日志源。
+
 ### 崩溃恢复
 
 每次提交依赖 DuckDB 的 WAL 持久化，批组边界额外 `CHECKPOINT`。进程被 `SIGKILL` 后，
@@ -155,20 +185,23 @@ shot_catalog_project/
 ├── run_tests.py                 # 隔离模式 pytest 引导（-I）
 ├── fixtures/                    # 自带夹具（生成的 JSONL 历史）
 ├── src/shot_catalog/
-│   ├── log_format.py            # 日志格式、校验、v1/v2 归一化
+│   ├── log_format.py            # 日志格式、校验、v1/v2 归一化、本地历史解析
 │   ├── fixturegen.py            # 确定性夹具生成（含 10 万镜头历史）
 │   ├── log_store.py             # 本地 HTTP 分页日志源（乱序/重复/500）
-│   ├── catalog.py               # DuckDB 持久目录、提交组、增量事务、查询
-│   ├── sync.py                  # 分页拉取、重试、同步循环、崩溃续跑
+│   ├── cold.py                  # 独立冷目录：Parquet 段、清单、故障注入与对账
+│   ├── catalog.py               # DuckDB 持久目录、冷热视图、提交组、归档、查询
+│   ├── sync.py                  # 分页拉取、冷端背压、同步循环、崩溃续跑
 │   └── server.py                # HTTP 查询接口与进程入口
 ├── scripts/
 │   ├── bootstrap.sh             # 依赖安装到独立 prefix
-│   ├── start_service.sh         # 启动日志源 + 查询服务
+│   ├── start_service.sh         # 启动日志源 + 查询服务（COLD_DIR 开启冷热分层）
 │   ├── verify.sh                # 一键验证（80 秒预算）
 │   ├── demo.py                  # 混合版本端到端演示
 │   ├── demo_large_batch.py      # 跨页十万级同批修订演示
-│   └── _sync_worker.py          # 恢复测试用的一次性同步 worker
-└── tests/                       # 31 个自动化测试
+│   ├── demo_cold_archive.py     # 多批夹具：旧库接续/强杀恢复/冷故障/离线重建
+│   ├── _sync_worker.py          # 恢复测试用的一次性同步 worker
+│   └── _cold_worker.py          # 冷归档强杀测试用的一次性 worker
+└── tests/                       # 42 个自动化测试（含 11 个冷热归档测试）
 ```
 
 ---
@@ -189,8 +222,9 @@ scripts/bootstrap.sh            # 安装 duckdb==2.0.0 与 pytest==9.2.0
 scripts/verify.sh
 ```
 
-它会运行覆盖全部必需场景的代表性测试、混合版本演示、跨页同批修订演示，并打印可读的分节结果。
-完整 31 项测试可随时单独运行：
+它会运行覆盖全部必需场景的代表性测试、混合版本演示、跨页同批修订演示、冷热归档
+四阶段演示（旧库接续 / 归档中途强杀 / 冷端故障背压 / 关闭日志源离线重建），
+并打印可读的分节结果。完整 41 项测试可随时单独运行：
 
 ```bash
 python3 -I run_tests.py -q
@@ -199,9 +233,12 @@ python3 -I run_tests.py -q
 ### 6.3 启动服务
 
 ```bash
-scripts/start_service.sh                          # 用自带混合历史
+scripts/start_service.sh                          # 用自带混合历史（纯热库，旧行为）
 # 或指定历史与数据库文件
 scripts/start_service.sh fixtures/mixed_history.jsonl run/catalog.duckdb
+# 开启冷热分层：已发布历史自动归档到独立冷目录
+COLD_DIR=run/cold scripts/start_service.sh \
+    fixtures/mixed_history.jsonl run/catalog.duckdb
 ```
 
 ### 6.4 查询
@@ -218,6 +255,7 @@ curl -s 'http://127.0.0.1:8080/stats'
 python3 -I scripts/demo.py                    # 混合版本/撤回/恢复，小而全
 python3 -I scripts/demo_large_batch.py        # 完整十万镜头同批修订
 python3 -I scripts/demo_large_batch.py 3000   # 缩小规模快速演示
+python3 -I scripts/demo_cold_archive.py 600   # 冷热归档四阶段一键验证
 ```
 
 ### 6.6 终止后恢复（手动演示）
@@ -240,6 +278,13 @@ python3 -I scripts/_sync_worker.py run/catalog.duckdb http://127.0.0.1:8081 100 
 | 跨页大批修订的原子性 | `test_batch_atomicity.py`（半批不可见、整批一次可见、跨 15+ 页） |
 | 终止后恢复 | `test_reopen_continues_from_durable_prefix`、`test_sigkill_then_restart_resumes`（真实子进程 SIGKILL） |
 | 同步期间查询一致 | `test_http_api.py::test_concurrent_reads_while_syncing`、`test_film_listing_is_one_consistent_snapshot` |
+| 归档不动水位/目录、未发布数据可提交、全历史可核对 | `test_cold_archive.py::test_archive_keeps_watermark_directory_and_queries`、`test_unpublished_staged_data_is_never_archived`、`test_batch_group_is_never_split_across_segments` |
+| 冷端故障：查询不中断、最多积压一个提交组、暂停翻页、恢复自动追赶 | `test_cold_outage_keeps_queries_and_bounds_backlog_to_one_group` |
+| 旧页重投只查热端并可回收 | `test_redelivery_of_archived_pages_is_hot_only_and_harmless` |
+| 关闭日志源后从本地历史重建核对目录 | `test_rebuild_and_verify_from_local_history_without_source` |
+| 冷目录对账（孤儿/tmp 清理、清单重建、段丢失离线） | `test_reconcile_removes_orphans_and_regenerates_manifest`、`test_missing_committed_segment_takes_cold_offline_but_queries_survive` |
+| 归档中途真实 SIGKILL 后恢复 | `test_sigkill_mid_archival_then_restart_resumes`（真实子进程 SIGKILL） |
+| 旧热库接续冷目录 | `test_legacy_hot_only_database_takes_cold_storage_later` |
 
 夹具（`fixturegen.py`）是真实生成的提交历史：v1 与 v2 记录交错修订同一批镜头、
 携带真实不同的秒/毫秒字段与修复说明，而不是给日志贴不同版本标签。

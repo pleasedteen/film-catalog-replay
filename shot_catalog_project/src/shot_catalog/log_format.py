@@ -252,6 +252,48 @@ def normalize_line(line: str) -> NormalizedRecord:
     return normalize(raw)
 
 
+def normalize_staged_line(line: str) -> NormalizedRecord:
+    """Parse a normalized staging-shape record (see Catalog.export_history_jsonl).
+
+    These lines are produced from already-validated staging rows and always
+    carry normalized millisecond durations plus explicit ``*_present`` flags,
+    so they are reconstructed directly without re-applying the v1/v2 payload
+    rules (a normalized v1 row legitimately stores a duration_ms value). This
+    is the offline rebuild path used after the HTTP log source is gone.
+    """
+    try:
+        raw = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise LogFormatError(f"invalid JSON line: {exc}") from exc
+    if not isinstance(raw, Mapping) or "event_type" not in raw:
+        raise LogFormatError("not a normalized staging record")
+    payload = raw.get("payload") or {}
+
+    def present(attr: str) -> bool:
+        return attr in payload
+
+    vals = {name: payload.get(name) for name in UPSETTABLE}
+    return NormalizedRecord(
+        seq=_require_int(raw, "seq"),
+        event_id=_require_str(raw, "event_id"),
+        event_type=_require_str(raw, "event_type"),
+        film_id=_require_str(raw, "film_id"),
+        shot_id=_require_str(raw, "shot_id"),
+        version=_require_int(raw, "version"),
+        ts=_require_str(raw, "ts"),
+        batch_id=raw.get("batch_id"),
+        title=vals["title"], title_present=present("title"),
+        description=vals["description"],
+        description_present=present("description"),
+        duration_ms=vals["duration_ms"],
+        duration_ms_present=present("duration_ms"),
+        scene=vals["scene"], scene_present=present("scene"),
+        camera=vals["camera"], camera_present=present("camera"),
+        repair_note=vals["repair_note"],
+        repair_note_present=present("repair_note"),
+    )
+
+
 def record_to_json(rec: Mapping[str, Any]) -> str:
     """Serialize a raw record dict back to a log line."""
     return json.dumps(rec, ensure_ascii=False, separators=(",", ":"))

@@ -1,22 +1,35 @@
-"""DuckDB-backed durable shot catalog.
+"""DuckDB-backed durable shot catalog with hot/cold history separation.
 
 Storage model
 =============
-* ``event_staging`` -- every normalized source record keyed by source seq.
-  Staging is an append-only, idempotent path: in-page duplicates are folded in
-  Python (only the current page is buffered) and cross-page redelivery is
-  discarded by a primary-key anti-join, so Python never holds more than one
-  fetched page at a time and never assembles a whole batch.
+* ``event_staging`` (HOT) -- every normalized source record not yet archived,
+  keyed by source seq. Staging is an append-only, idempotent path: in-page
+  duplicates are folded in Python (only the current page is buffered) and
+  cross-page redelivery is discarded by a primary-key anti-join against the
+  HOT table only, so Python never holds more than one fetched page at a time
+  and never assembles a whole batch.
+
+* cold segment files (COLD) -- already-published history that a background
+  archival step moved out of the hot database into independently maintainable
+  Parquet segments (see ``cold.py``). A ``cold_archive_state`` table inside
+  the hot database is the authoritative index of what moved; the on-disk
+  manifest and Parquet files are derived/repair-able from it.
+
+* ``event_history`` -- a view over hot staging UNION cold segments, with hot
+  rows winning on seq overlap (redelivery of an archived page lands back in
+  hot staging and shadows its cold copy). It is the table used by full-history
+  rebuild/verification; the per-commit delta path only ever touches hot rows.
 
 * ``shot_state`` -- one row per shot ever seen, holding its current
   attributes and a ``withdrawn`` flag. ``catalog_current`` is a VIEW of the
   visible rows (``NOT withdrawn``), so a withdrawn shot simply disappears from
-  every query and reappears on republish.
+  every query and reappears on republish. Queries never read the cold side,
+  so a cold outage cannot block them.
 
 * ``sync_state`` -- the single durable progress pointer
   (``last_snapshot_seq``), updated in the SAME transaction as the state it
   describes. Saved progress and query answers therefore always refer to the
-  same complete prefix of source history.
+  same complete prefix of source history. Archival never moves this pointer.
 
 Incremental commits
 ===================
@@ -39,6 +52,7 @@ from typing import Any, Iterable
 
 import duckdb
 
+from .cold import ColdStorage, ColdUnavailable, SegmentInfo
 from .log_format import NormalizedRecord
 
 STAGING_COLUMNS = """
@@ -104,7 +118,7 @@ WITH g AS (
         {latest_seqs},
         arg_max(CASE WHEN event_type = 'withdraw' THEN 1
                      WHEN event_type = 'republish' THEN 0 END, seq) AS dwd
-    FROM event_staging
+    FROM __EVENT_TABLE__
     WHERE seq BETWEEN $start_seq AND $end_seq
     GROUP BY film_id, shot_id
 )
@@ -119,7 +133,7 @@ _LATEST_SEQS = ",\n        ".join(
     f"max(seq) FILTER (WHERE {a}_present) AS {a}_seq" for a in _ATTRS
 )
 _JOIN_CLAUSES = "\n".join(
-    f"LEFT JOIN event_staging {a}e "
+    f"LEFT JOIN __EVENT_TABLE__ {a}e "
     f"ON {a}e.seq = g.{a}_seq AND {a}e.film_id = g.film_id AND {a}e.shot_id = g.shot_id"
     for a in _ATTRS
 )
@@ -144,7 +158,7 @@ WITH g AS (
         {latest_seqs},
         COALESCE(arg_max(CASE WHEN event_type = 'withdraw' THEN 1
                               WHEN event_type = 'republish' THEN 0 END, seq), false) AS withdrawn
-    FROM event_staging
+    FROM __EVENT_TABLE__
     WHERE seq <= $last_seq
     GROUP BY film_id, shot_id
 )
@@ -174,8 +188,29 @@ class CommitGroup:
         return self.end_seq - self.start_seq + 1
 
 
+@dataclass(frozen=True)
+class ArchiveResult:
+    """One cold segment produced by an archival step."""
+
+    seg_id: int
+    start_seq: int
+    end_seq: int
+    row_count: int
+    checksum: str
+    file_name: str
+
+    @property
+    def size(self) -> int:
+        return self.end_seq - self.start_seq + 1
+
+
+# Column list of event_staging / cold segment Parquet in SELECT order.
+_HISTORY_COLS = ", ".join(STAGING_COLS)
+
+
 class Catalog:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path,
+                 cold: ColdStorage | str | Path | None = None):
         self.db_path = str(db_path)
         # One connection guarded by an RLock: DuckDB disallows mixing
         # read-only and read-write connections to one file in a process.
@@ -184,7 +219,14 @@ class Catalog:
         self._lock = threading.RLock()
         self._conn = duckdb.connect(self.db_path)
         self._stage_ready = False
+        if isinstance(cold, ColdStorage) or cold is None:
+            self.cold = cold
+        else:
+            self.cold = ColdStorage(cold)
+        self._cold_view_ready = False
         self._init_schema()
+        if self.cold is not None:
+            self._reconcile_cold()
 
     # ------------------------------------------------------------------ schema
     def _init_schema(self) -> None:
@@ -215,6 +257,17 @@ class Catalog:
                 )
             """)
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS cold_archive_state (
+                    seg_id INTEGER PRIMARY KEY,
+                    start_seq BIGINT NOT NULL,
+                    end_seq BIGINT NOT NULL,
+                    row_count BIGINT NOT NULL,
+                    checksum VARCHAR NOT NULL,
+                    file_name VARCHAR NOT NULL,
+                    archived_at VARCHAR NOT NULL
+                )
+            """)
+            conn.execute("""
                 INSERT INTO sync_state (id, last_snapshot_seq, updated_at)
                 SELECT 1, 0, strftime(now(), '%Y-%m-%dT%H:%M:%SZ')
                 WHERE NOT EXISTS (SELECT 1 FROM sync_state)
@@ -237,6 +290,407 @@ class Catalog:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    # -------------------------------------------------------------- cold side
+    def cold_available(self) -> bool:
+        """True when no cold side is configured or the cold side is healthy."""
+        return self.cold is None or self.cold.available
+
+    def _committed_segments(self) -> list[SegmentInfo]:
+        rows = self._conn.execute("""
+            SELECT seg_id, start_seq, end_seq, row_count, checksum,
+                   file_name, archived_at
+            FROM cold_archive_state ORDER BY seg_id
+        """).fetchall()
+        return [SegmentInfo.from_row(r) for r in rows]
+
+    def _reconcile_cold(self) -> dict:
+        """Repair cold files/manifest against the authoritative state table."""
+        assert self.cold is not None
+        with self._lock:
+            segments = self._committed_segments()
+            report = self.cold.reconcile(segments)
+            # A missing committed segment flips the cold side offline; the
+            # catalog must still open, so only build the history view when
+            # the cold side is readable.
+            if self.cold.available:
+                self._refresh_cold_view()
+            else:
+                self._cold_view_ready = False
+            return report
+
+    def _refresh_cold_view(self) -> None:
+        """(Re)create the hot+cold history view from the Parquet segment glob.
+
+        Only created when at least one segment exists, so a database with no
+        archives never depends on a Parquet glob resolving. Raises
+        ColdUnavailable when the cold side is offline: callers of archive /
+        verification propagate it, while the hot query path never gets here.
+        """
+        if self.cold is None:
+            self._cold_view_ready = False
+            return
+        self.cold.check_available("refresh_cold_view")
+        conn = self._conn
+        conn.execute("DROP VIEW IF EXISTS event_history")
+        files = self.cold.list_segment_files()
+        if not files:
+            self._cold_view_ready = False
+            return
+        glob = str(self.cold.segments_dir / "*.parquet")
+        # Hot rows shadow cold rows while present; redelivered archived rows
+        # remain authoritative in the hot table until their content is verified
+        # against the Parquet copies and reclaimed.
+        conn.execute(f"""
+            CREATE VIEW event_history AS
+            SELECT {_HISTORY_COLS} FROM event_staging
+            UNION ALL
+            SELECT {_HISTORY_COLS} FROM read_parquet('{glob}') h
+            WHERE NOT EXISTS (
+                SELECT 1 FROM event_staging e WHERE e.seq = h.seq
+            )
+        """)
+        self._cold_view_ready = True
+
+    def _history_table(self) -> str:
+        """Table/view covering the whole durable history (hot + cold)."""
+        if self.cold is not None and self._cold_view_ready:
+            self.cold.check_available("read_cold_history")
+            return "event_history"
+        return "event_staging"
+
+    def archived_through_seq(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT max(end_seq) FROM cold_archive_state"
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def _set_meta(self, key: str, value: str) -> None:
+        self._conn.execute("""
+            INSERT INTO catalog_meta VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, [key, value])
+
+    def _get_meta(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM catalog_meta WHERE key = ?", [key]
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def record_fetch_watermark(self, seq: int) -> None:
+        """Durable high-water mark of the highest seq ever pulled."""
+        with self._lock:
+            if seq > self.fetch_watermark():
+                self._set_meta("max_fetch_seq", str(int(seq)))
+
+    def fetch_watermark(self) -> int:
+        with self._lock:
+            raw = self._get_meta("max_fetch_seq")
+        return int(raw or 0)
+
+    def hot_published_group_count(self) -> int:
+        """Published-but-not-archived commit groups still held in the hot db.
+
+        Ordinary (batch_id IS NULL) contiguous rows count as one coalesced
+        group; every same-batch run counts as one group. This is the backlog
+        the sync engine bounds while the cold side is unavailable.
+        """
+        with self._lock:
+            archived = self.archived_through_seq()
+            ordinary_groups = int(self._conn.execute("""
+                SELECT count(*) FROM (
+                    SELECT grp FROM (
+                        SELECT seq,
+                               seq - row_number() OVER (ORDER BY seq) AS grp
+                        FROM event_staging
+                        WHERE seq <= (SELECT last_snapshot_seq FROM sync_state WHERE id = 1)
+                          AND seq > ? AND batch_id IS NULL
+                    )
+                    GROUP BY grp
+                )
+            """, [archived]).fetchone()[0])
+            batch_groups = int(self._conn.execute("""
+                SELECT count(DISTINCT batch_id) FROM event_staging
+                WHERE seq <= (SELECT last_snapshot_seq FROM sync_state WHERE id = 1)
+                  AND seq > ? AND batch_id IS NOT NULL
+            """, [archived]).fetchone()[0])
+            return ordinary_groups + batch_groups
+
+    def _reclaim_shadowed_hot_rows(self) -> int:
+        """Drop hot rows that merely redeliver an already-archived seq.
+
+        Old-page redelivery lands back in hot staging; the hot+cold view lets
+        those rows shadow their cold copy. They can never be re-archived (their
+        seq is below the archival boundary), so once their content is verified
+        identical to the cold segment they came from, they are deleted here to
+        shrink the hot database back to its working set. Returns the row count.
+        """
+        if self.cold is None or not self._cold_view_ready:
+            return 0
+        with self._lock:
+            # Never reclaim while the cold side is unreadable: shadow rows are
+            # then the only local copy of their seqs.
+            self.cold.check_available("reclaim_shadowed_rows")
+            archived = self.archived_through_seq()
+            if archived <= 0:
+                return 0
+            glob = str(self.cold.segments_dir / "*.parquet")
+            # Compare against the raw Parquet segments (not the hot+cold view,
+            # where the redelivered hot row would shadow its cold copy).
+            mismatch = self._conn.execute(f"""
+                SELECT count(*) FROM event_staging e
+                JOIN read_parquet('{glob}') c ON c.seq = e.seq
+                WHERE e.seq <= {archived}
+                  AND (e.event_id IS DISTINCT FROM c.event_id
+                       OR e.event_type IS DISTINCT FROM c.event_type
+                       OR e.film_id IS DISTINCT FROM c.film_id
+                       OR e.shot_id IS DISTINCT FROM c.shot_id
+                       OR e.version IS DISTINCT FROM c.version
+                       OR e.ts IS DISTINCT FROM c.ts
+                       OR e.batch_id IS DISTINCT FROM c.batch_id
+                       OR e.title IS DISTINCT FROM c.title
+                       OR e.title_present IS DISTINCT FROM c.title_present
+                       OR e.description IS DISTINCT FROM c.description
+                       OR e.description_present IS DISTINCT FROM c.description_present
+                       OR e.duration_ms IS DISTINCT FROM c.duration_ms
+                       OR e.duration_ms_present IS DISTINCT FROM c.duration_ms_present
+                       OR e.scene IS DISTINCT FROM c.scene
+                       OR e.scene_present IS DISTINCT FROM c.scene_present
+                       OR e.camera IS DISTINCT FROM c.camera
+                       OR e.camera_present IS DISTINCT FROM c.camera_present
+                       OR e.repair_note IS DISTINCT FROM c.repair_note
+                       OR e.repair_note_present IS DISTINCT FROM c.repair_note_present)
+            """).fetchone()[0]
+            if int(mismatch) != 0:
+                raise RuntimeError(
+                    "redelivered hot row differs from its archived cold copy"
+                )
+            count = int(self._conn.execute("""
+                SELECT count(*) FROM event_staging WHERE seq <= ?
+            """, [archived]).fetchone()[0])
+            if count:
+                self._conn.execute(
+                    "DELETE FROM event_staging WHERE seq <= ?", [archived])
+            return count
+
+    def archive_published_prefix(self, target_rows: int = 5000) -> ArchiveResult | None:
+        """Move one bounded slice of already-published hot history to the cold
+        side without touching the directory layout or the published watermark.
+
+        Only rows with ``archived_through < seq <= last_snapshot_seq`` are
+        eligible, so unpublished (staged-ahead) data can never be archived.
+        The slice is cut at batch boundaries: a same-batch group is never
+        split across segments. Returns None when nothing is archivable.
+        """
+        if self.cold is None:
+            raise ColdUnavailable("no cold storage configured")
+        with self._lock:
+            conn = self._conn
+            self._reclaim_shadowed_hot_rows()
+            snapshot = self.last_snapshot_seq()
+            archived = self.archived_through_seq()
+            start = archived + 1
+            if start > snapshot:
+                return None
+            present = conn.execute(
+                "SELECT count(*) FROM event_staging WHERE seq = ?", [start]
+            ).fetchone()[0]
+            if not present:
+                return None  # nothing hot to archive at the prefix
+            self.cold.ensure_dirs()
+            next_seg = int(conn.execute(
+                "SELECT coalesce(max(seg_id), 0) + 1 FROM cold_archive_state"
+            ).fetchone()[0])
+
+            # Upper bound of this slice, then pull back to a batch boundary.
+            want_end = min(snapshot, start + target_rows - 1)
+            row = conn.execute(
+                "SELECT batch_id FROM event_staging WHERE seq = ?", [start]
+            ).fetchone()
+            if row[0] is not None:
+                # Whole same-batch run, wherever it ends within the prefix.
+                end_row = conn.execute("""
+                    SELECT max(seq) FROM event_staging
+                    WHERE seq BETWEEN ? AND ? AND batch_id = ?
+                """, [start, snapshot, row[0]]).fetchone()
+                end_seq = int(end_row[0])
+            else:
+                boundary = conn.execute("""
+                    SELECT min(seq) FROM event_staging
+                    WHERE seq BETWEEN ? AND ? AND batch_id IS NOT NULL
+                """, [start, want_end]).fetchone()
+                if boundary[0] is not None:
+                    end_seq = int(boundary[0]) - 1
+                else:
+                    end_row = conn.execute("""
+                        SELECT max(seq) FROM event_staging
+                        WHERE seq BETWEEN ? AND ? AND batch_id IS NULL
+                    """, [start, want_end]).fetchone()
+                    end_seq = int(end_row[0])
+
+            tmp_path = self.cold.tmp_segment_path(next_seg)
+            final_name = self.cold.segment_name(next_seg)
+            # 1) export + read-back verification BEFORE anything is deleted.
+            conn.execute(f"""
+                COPY (
+                    SELECT {_HISTORY_COLS} FROM event_staging
+                    WHERE seq BETWEEN {start} AND {end_seq} ORDER BY seq
+                ) TO '{tmp_path}' (FORMAT PARQUET)
+            """)
+            self.cold.rename_tmp_to_final(next_seg)
+            verify = conn.execute(f"""
+                SELECT count(*), min(seq), max(seq),
+                       coalesce(sum(hash(seq::VARCHAR || '|' || event_id) % 1000000007), 0)
+                FROM read_parquet('{self.cold.segment_path(next_seg)}')
+            """).fetchone()
+            row_count, min_seq, max_seq, checksum = verify
+            expected = conn.execute("""
+                SELECT count(*), min(seq), max(seq),
+                       coalesce(sum(hash(seq::VARCHAR || '|' || event_id) % 1000000007), 0)
+                FROM event_staging WHERE seq BETWEEN ? AND ?
+            """, [start, end_seq]).fetchone()
+            if (int(row_count), int(min_seq), int(max_seq), str(checksum)) != (
+                int(expected[0]), int(expected[1]), int(expected[2]), str(expected[3])
+            ):
+                self.cold.remove_file(self.cold.segment_path(next_seg))
+                raise RuntimeError(
+                    f"cold segment {next_seg} read-back verification failed"
+                )
+
+            # 2) the destructive half is one transaction + checkpoint.
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                conn.execute(
+                    "DELETE FROM event_staging WHERE seq BETWEEN ? AND ?",
+                    [start, end_seq],
+                )
+                conn.execute("""
+                    INSERT INTO cold_archive_state
+                        (seg_id, start_seq, end_seq, row_count, checksum,
+                         file_name, archived_at)
+                    VALUES (?, ?, ?, ?, ?, ?, strftime(now(), '%Y-%m-%dT%H:%M:%SZ'))
+                """, [next_seg, start, end_seq, row_count, str(checksum),
+                      final_name])
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("CHECKPOINT")
+
+            # 3) derived manifest + view; both regenerable from state on reopen.
+            segments = self._committed_segments()
+            self.cold.write_manifest(segments, end_seq)
+            self._refresh_cold_view()
+            return ArchiveResult(
+                seg_id=next_seg, start_seq=start, end_seq=end_seq,
+                row_count=int(row_count), checksum=str(checksum),
+                file_name=final_name,
+            )
+
+    def drain_hot_to_cold(self, target_rows: int = 5000) -> list[ArchiveResult]:
+        """Archive every currently eligible slice; used by the one-click
+        verification and by the automatic catch-up after a cold outage."""
+        results: list[ArchiveResult] = []
+        while True:
+            piece = self.archive_published_prefix(target_rows)
+            if piece is None:
+                return results
+            results.append(piece)
+
+    # ------------------------------------------------- local-history rebuild
+    def export_history_jsonl(self, jsonl_path: str | Path) -> int:
+        """Write the full durable history (cold + hot) as gapless JSONL.
+
+        The staging rows store normalized columns rather than the original raw
+        payload shape, so this emits a normalized JSONL that ``normalize`` and
+        ``load_jsonl_history`` can round-trip. It is the offline source used to
+        rebuild and verify the catalog after the HTTP log source is gone.
+        """
+        from .log_format import record_to_json
+        path = Path(jsonl_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        table = self._history_table()
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_HISTORY_COLS} FROM {table} ORDER BY seq"
+            ).fetchall()
+        with path.open("w", encoding="utf-8") as fh:
+            for row in rows:
+                rec = _staging_row_to_raw(dict(zip(STAGING_COLS, row)))
+                fh.write(record_to_json(rec) + "\n")
+        return len(rows)
+
+    def load_jsonl_history(self, jsonl_path: str | Path) -> int:
+        """Load normalized JSONL history into hot staging (idempotent).
+
+        This rebuild path does not need the HTTP log source at all: the local
+        history file is enough to repopulate staging for a full verification.
+        """
+        from .log_format import normalize_staged_line
+        path = Path(jsonl_path)
+        count = 0
+        batch: list[NormalizedRecord] = []
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    batch.append(normalize_staged_line(line))
+                    if len(batch) >= 1000:
+                        count += self.stage_records(batch)
+                        batch = []
+        if batch:
+            count += self.stage_records(batch)
+        return count
+
+    def verify_full_history_oracle(self) -> int:
+        """Rebuild the catalog from the whole hot+cold history and compare.
+
+        The rebuild is bounded by the published snapshot, not by the max
+        staged seq: rows staged ahead of the watermark are, by design, not yet
+        reflected in ``shot_state``, so including them would manufacture
+        mismatches. With archives present the history view spans cold + hot,
+        proving the already-archived prefix still reconstructs exactly the
+        current state. Raises ColdUnavailable if archived segments exist but
+        the cold side is currently unreadable.
+        """
+        with self._lock:
+            if self.cold is not None and self.archived_through_seq() > 0:
+                self.cold.check_available("verify_full_history_oracle")
+                if not self._cold_view_ready:
+                    raise ColdUnavailable(
+                        "cold history view unavailable during verification")
+            table = self._history_table()
+            last_seq = self.last_snapshot_seq()
+            self._conn.execute("DROP TABLE IF EXISTS _rebuild")
+            self._conn.execute(
+                _REBUILD_SQL.format(latest_seqs=_REBUILD_LATEST_SEQS,
+                                    selects=_REBUILD_SELECTS,
+                                    joins=_JOIN_CLAUSES,
+                                    ).replace("__EVENT_TABLE__", table),
+                {"last_seq": last_seq},
+            )
+            mismatches = self._conn.execute("""
+                SELECT count(*) FROM (
+                    SELECT film_id, shot_id, version, last_event_seq, last_ts,
+                           title, description, duration_ms, scene, camera,
+                           repair_note, withdrawn FROM shot_state
+                    EXCEPT
+                    SELECT film_id, shot_id, version, last_event_seq, last_ts,
+                           title, description, duration_ms, scene, camera,
+                           repair_note, withdrawn FROM _rebuild
+                    UNION ALL
+                    SELECT film_id, shot_id, version, last_event_seq, last_ts,
+                           title, description, duration_ms, scene, camera,
+                           repair_note, withdrawn FROM _rebuild
+                    EXCEPT
+                    SELECT film_id, shot_id, version, last_event_seq, last_ts,
+                           title, description, duration_ms, scene, camera,
+                           repair_note, withdrawn FROM shot_state
+                )
+            """).fetchone()[0]
+            self._conn.execute("DROP TABLE IF EXISTS _rebuild")
+            return int(mismatches)
 
     # ------------------------------------------------------------------ staging
     def stage_records(self, records: Iterable[NormalizedRecord]) -> int:
@@ -410,7 +864,8 @@ class Catalog:
                 conn.execute(
                     _DELTA_GROUP_SQL.format(latest_seqs=_LATEST_SEQS,
                                             join_selects=_JOIN_SELECTS,
-                                            joins=_JOIN_CLAUSES),
+                                            joins=_JOIN_CLAUSES,
+                                            ).replace("__EVENT_TABLE__", "event_staging"),
                     {"start_seq": start_seq, "end_seq": end_seq},
                 )
                 # 1) merge into shots that already exist
@@ -471,14 +926,20 @@ class Catalog:
 
     # ------------------------------------------------------------- verification
     def rebuild_mismatch_count(self) -> int:
-        """Test oracle: compare incremental state with a full-prefix rebuild."""
+        """Test oracle: compare incremental state with a full-prefix rebuild.
+
+        The rebuild reads the full hot+cold history view when archives exist,
+        so the oracle still covers history that has already moved to cold.
+        """
         with self._lock:
             seq = self.last_snapshot_seq()
+            table = self._history_table()
             self._conn.execute("DROP TABLE IF EXISTS _rebuild")
             self._conn.execute(
                 _REBUILD_SQL.format(latest_seqs=_REBUILD_LATEST_SEQS,
                                     selects=_REBUILD_SELECTS,
-                                    joins=_JOIN_CLAUSES),
+                                    joins=_JOIN_CLAUSES,
+                                    ).replace("__EVENT_TABLE__", table),
                 {"last_seq": seq},
             )
             mismatches = self._conn.execute("""
@@ -548,13 +1009,49 @@ class Catalog:
             snapshot = self._conn.execute(
                 "SELECT last_snapshot_seq FROM sync_state WHERE id = 1"
             ).fetchone()[0]
-        return {
+            cold_segments = int(self._conn.execute(
+                "SELECT count(*) FROM cold_archive_state"
+            ).fetchone()[0])
+            cold_events = int(self._conn.execute(
+                "SELECT coalesce(sum(row_count), 0) FROM cold_archive_state"
+            ).fetchone()[0])
+            archived_through = self.archived_through_seq()
+        out = {
             "snapshot_seq": int(snapshot),
             "staged_events": int(staged[0]),
             "max_staged_seq": int(staged[1] or 0),
             "visible_shots": int(visible),
             "films": int(films),
+            "cold_enabled": self.cold is not None,
+            "cold_available": self.cold_available(),
+            "cold_segments": cold_segments,
+            "cold_events": cold_events,
+            "archived_through_seq": archived_through,
+            "fetch_watermark_seq": self.fetch_watermark(),
         }
+        return out
+
+
+def _staging_row_to_raw(row: dict[str, Any]) -> dict[str, Any]:
+    """Reverse the staging columns back into a normalized raw log record."""
+    rec: dict[str, Any] = {
+        "seq": int(row["seq"]),
+        "event_id": row["event_id"],
+        "event_type": row["event_type"],
+        "film_id": row["film_id"],
+        "shot_id": row["shot_id"],
+        "version": int(row["version"]),
+        "ts": row["ts"],
+    }
+    if row["batch_id"] is not None:
+        rec["batch_id"] = row["batch_id"]
+    if row["event_type"] == "upsert":
+        payload: dict[str, Any] = {}
+        for attr in _ATTRS:
+            if row[f"{attr}_present"]:
+                payload[attr] = row[attr]
+        rec["payload"] = payload
+    return rec
 
 
 def _row_to_dict(cols: list[str], row: tuple) -> dict[str, Any]:
