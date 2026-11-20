@@ -210,6 +210,56 @@ def generate_large_history(path: str | Path, n_shots: int = 100_000) -> dict[str
     }
 
 
+def describe_history(path: str | Path) -> dict[str, Any]:
+    """Derive a summary from an existing history file, without regenerating it.
+
+    Used by demos/tests that must run on the *bundled* fixtures verbatim.
+    The summary exposes the same shape as the generators (``total_events``,
+    ``batch``, ``n_shots`` when applicable) plus the source-implied expected
+    visible count.
+    """
+    path = Path(path)
+    total = 0
+    batch_counts: dict[str, list[int]] = {}
+    shots: set[tuple[str, str]] = set()
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            total = max(total, int(rec["seq"]))
+            shots.add((rec["film_id"], rec["shot_id"]))
+            bid = rec.get("batch_id")
+            if bid is not None:
+                batch_counts.setdefault(bid, []).append(int(rec["seq"]))
+    info: dict[str, Any] = {"path": str(path), "total_events": total,
+                            "shots": len(shots)}
+    if batch_counts:
+        batch_id = max(batch_counts, key=lambda k: len(batch_counts[k]))
+        seqs = batch_counts[batch_id]
+        info["batch"] = {"id": batch_id, "start_seq": min(seqs),
+                         "end_seq": max(seqs), "size": len(seqs)}
+    # The 100k fixture has exactly one film ("film-bulk") whose shot ids are
+    # L######; expose the large-history fields the demos/tests expect.
+    films = {film for film, _ in shots}
+    if films == {"film-bulk"}:
+        # Bulk shots are L followed by digits; the LW* lifecycle shots are
+        # not part of the batch revision and must not inflate n_shots.
+        n_shots = sum(
+            1 for film, shot in shots
+            if film == "film-bulk" and shot.startswith("L")
+            and shot[1:].isdigit()
+        )
+        if n_shots:
+            info["n_shots"] = n_shots
+            info["expected_visible_count"] = len(shots)
+            info["sample_shot"] = "L000001"
+            info["sample_duration_ms"] = (10 + (1 % 7)) * 1000 + 250
+            info["sample_repair_note"] = "B900 统一毫秒化修复 #1"
+    return info
+
+
 def write_tiny_history(path: str | Path) -> dict[str, Any]:
     """A handful of records for focused unit tests."""
     path = Path(path)

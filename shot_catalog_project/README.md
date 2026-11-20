@@ -17,7 +17,10 @@
 * **部分修订**：一次修订可只改部分属性，可把镜头说明清空而不动其它属性；
 * **撤回 / 重新发布**：撤回期间镜头不可检索，重新发布后恢复可检索；
 * **跨页大批量修订**：一次资料修复可同批修订十万条镜头，事务跨越几千个日志页，必须整体可见；
-* **进程被杀**：重启后要从持久状态继续，且已保存的进度与查询结果对应同一段完整历史。
+* **进程被杀**：重启后要从持久状态继续，且已保存的进度与查询结果对应同一段完整历史；
+* **大批次写入不阻塞查询**：跨页修订停在提交前时，单镜头、影片清单和健康检查要立即返回
+  上一个已发布版本；慢客户端读十万镜头清单时，后续批次仍可发布，服务端内存有界，
+  客户端断开则释放该请求资源。
 
 目录的唯一事实来源是每条记录的 **`seq`（源端提交顺序）**，与网络投递顺序无关。
 
@@ -89,7 +92,7 @@
 | `GET /health` | 健康检查 + 同步统计 |
 | `GET /stats` | 暂存事件数、快照 seq、可见镜头数、影片数 |
 | `GET /shot?film_id=F&shot_id=S` | 查询单个镜头；不存在或撤回中返回 `404` |
-| `GET /film/<film_id>` | 返回该影片**完整镜头清单**，整个响应来自同一个一致快照 |
+| `GET /film/<film_id>` | 返回该影片**完整镜头清单**；以分块（chunked）流式输出，整个响应来自同一个已发布快照 |
 
 单镜头响应（时长永远是毫秒，修复说明为空时为 `null`）：
 
@@ -108,6 +111,11 @@
 ```json
 {"film_id":"film-a","snapshot_seq":24,"count":3,"shots":[ ... ]}
 ```
+
+清单响应是 `Transfer-Encoding: chunked`：`count` 先于行数据给出，行按
+`shot_id` 键集分页从同一个读取事务中取出，因此服务端在 Python 中只保留
+一页（默认 1000 行）的数据。十万镜头的清单不会整个驻留内存，也会一次性
+对应同一个已发布版本；客户端中途断开时该请求的快照随即释放。
 
 ---
 
@@ -137,12 +145,26 @@
 测试里还内置了一个独立的“全前缀重建” oracle（`rebuild_mismatch_count`），
 用另一条 SQL 路径从全部暂存事件重算目录，与增量状态逐行比对，应为 0。
 
+### 读取与写入解耦（快照读）
+
+写事务再大也不会挡住查询：每个请求用 DuckDB 的一个独立 **cursor**（同一文件的独立连接）
+开启自己的只读事务，读到的是**最近一次已提交**的版本，不等写线程的锁。
+
+* 跨页大批量修订停在 `COMMIT` 之前时，单镜头查询、影片清单和 `/health` 仍立即返回
+  **上一个已发布版本**；整批提交后一起变成新版本。
+* 慢客户端读取十万镜头清单时，后续批次可以继续发布；清单的每一行都来自请求开始时
+  那一个快照，`snapshot_seq` 与内容严格对应。服务端按页读取、分块写出，Python 内存
+  有界（与清单大小无关）。
+* 客户端断开则立即关闭该请求的 cursor，释放被钉住的快照。
+* `CHECKPOINT` 改为尽力而为：有读取事务时可能被拒绝，此时依赖 WAL 恢复，不影响提交正确性。
+
 ### 崩溃恢复
 
 每次提交依赖 DuckDB 的 WAL 持久化，批组边界额外 `CHECKPOINT`。进程被 `SIGKILL` 后，
 重启打开同一个文件：`last_snapshot_seq` 指向最后一个完整提交的前缀，同步器从该前缀附近重新拉页
 （重复投递本就幂等），继续追赶。已保存进度与查询结果始终对应同一段完整历史。
-恢复过程中查询服务继续响应；每个请求在单一连接的锁内读到一个一致快照。
+恢复过程中查询服务继续响应；每个请求在独立 cursor 的只读事务里读到一个一致快照，
+与写线程互不阻塞。
 
 ---
 
@@ -167,8 +189,9 @@ shot_catalog_project/
 │   ├── verify.sh                # 一键验证（80 秒预算）
 │   ├── demo.py                  # 混合版本端到端演示
 │   ├── demo_large_batch.py      # 跨页十万级同批修订演示
+│   ├── demo_snapshot_reads.py   # 写入暂停 / 慢读 / 断开（用自带夹具）
 │   └── _sync_worker.py          # 恢复测试用的一次性同步 worker
-└── tests/                       # 31 个自动化测试
+└── tests/                       # 35 个自动化测试
 ```
 
 ---
@@ -189,8 +212,9 @@ scripts/bootstrap.sh            # 安装 duckdb==2.0.0 与 pytest==9.2.0
 scripts/verify.sh
 ```
 
-它会运行覆盖全部必需场景的代表性测试、混合版本演示、跨页同批修订演示，并打印可读的分节结果。
-完整 31 项测试可随时单独运行：
+它会运行覆盖全部必需场景的代表性测试、混合版本演示、跨页同批修订演示，以及
+写入暂停 / 慢客户端 / 断开快照清理的演示（全部只用自带夹具），并打印可读的分节结果。
+完整 35 项测试可随时单独运行：
 
 ```bash
 python3 -I run_tests.py -q
@@ -218,6 +242,7 @@ curl -s 'http://127.0.0.1:8080/stats'
 python3 -I scripts/demo.py                    # 混合版本/撤回/恢复，小而全
 python3 -I scripts/demo_large_batch.py        # 完整十万镜头同批修订
 python3 -I scripts/demo_large_batch.py 3000   # 缩小规模快速演示
+python3 -I scripts/demo_snapshot_reads.py     # 写入暂停 / 十万清单慢读 / 断开
 ```
 
 ### 6.6 终止后恢复（手动演示）
@@ -240,6 +265,9 @@ python3 -I scripts/_sync_worker.py run/catalog.duckdb http://127.0.0.1:8081 100 
 | 跨页大批修订的原子性 | `test_batch_atomicity.py`（半批不可见、整批一次可见、跨 15+ 页） |
 | 终止后恢复 | `test_reopen_continues_from_durable_prefix`、`test_sigkill_then_restart_resumes`（真实子进程 SIGKILL） |
 | 同步期间查询一致 | `test_http_api.py::test_concurrent_reads_while_syncing`、`test_film_listing_is_one_consistent_snapshot` |
+| 写入暂停时查询仍可用 | `test_snapshot_reads.py::test_reads_answer_last_published_version_while_batch_is_paused` |
+| 十万清单慢读、后续批次照常发布、单版本响应 | `test_snapshot_reads.py::test_slow_listing_keeps_its_version_while_later_batches_publish`、`test_listing_pages_share_one_snapshot_across_a_commit` |
+| 断开后释放请求资源、同步继续 | `test_snapshot_reads.py::test_client_disconnect_releases_snapshot_and_sync_continues` |
 
 夹具（`fixturegen.py`）是真实生成的提交历史：v1 与 v2 记录交错修订同一批镜头、
 携带真实不同的秒/毫秒字段与修复说明，而不是给日志贴不同版本标签。

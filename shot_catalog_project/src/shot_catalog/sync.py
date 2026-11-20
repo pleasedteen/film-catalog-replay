@@ -93,7 +93,8 @@ class SyncEngine:
     def __init__(self, catalog: Catalog, client: LogSourceClient,
                  *, page_size: int = 100, poll_interval: float = 0.15,
                  sleep: Callable[[float], None] = time.sleep,
-                 on_commit: Callable[[CommitGroup], None] | None = None):
+                 on_commit: Callable[[CommitGroup], None] | None = None,
+                 before_commit: Callable[[CommitGroup], None] | None = None):
         self.catalog = catalog
         self.client = client
         self.page_size = page_size
@@ -102,6 +103,10 @@ class SyncEngine:
         # Invoked after every durable commit group, while holding no engine
         # lock; lets a supervisor observe/act on each prefix advancement.
         self.on_commit = on_commit
+        # Invoked for every commit group *inside* its still-uncommitted
+        # transaction (before publication). Tests/demos use it to freeze a
+        # cross-page revision at the moment that used to block readers.
+        self.before_commit = before_commit
         self._stop = False
         self.counters = SyncCounters()
 
@@ -157,25 +162,22 @@ class SyncEngine:
             if group.batch_id is not None:
                 self._apply(group)
                 continue
-            # Coalesce ready ordinary records by inspecting the staging rows
-            # directly: the flush ends just before a batch boundary or at the
-            # first seq that has not been durably staged yet.
+            # Coalesce ready ordinary records: the flush ends just before a
+            # batch boundary or at the first seq that has not been durably
+            # staged yet. ``ordinary_run_end`` resolves that boundary inside
+            # DuckDB (one statement) instead of walking seq by seq in Python.
             start = group.start_seq
-            end = start
             limit = start + ordinary_flush_size - 1
-            while end < limit:
-                nxt = end + 1
-                row = self.catalog.next_staged_seq(nxt)
-                if row is None:
-                    break  # not staged yet (or source tail reached)
-                nxt_seq, nxt_batch = row
-                if nxt_seq != nxt or nxt_batch is not None:
-                    break  # gap, or a same-batch group starts here
-                end = nxt
+            end = self.catalog.ordinary_run_end(start, limit)
             self._apply(CommitGroup(start, end, None), logical_size=end - start + 1)
 
     def _apply(self, group: CommitGroup, *, logical_size: int | None = None) -> None:
-        self.catalog.apply_range(group.start_seq, group.end_seq, group.batch_id)
+        # ``before_commit`` is the seam used by tests/demos to park a
+        # cross-page revision immediately before publication; it must not
+        # block readers (they hold their own snapshots) nor be skipped.
+        hook = (lambda: self.before_commit(group)) if self.before_commit else None
+        self.catalog.apply_range(group.start_seq, group.end_seq, group.batch_id,
+                                 before_commit=hook)
         self.counters.groups_committed += 1
         eff_size = logical_size or group.size
         self.counters.largest_group = max(self.counters.largest_group, eff_size)

@@ -12,16 +12,21 @@ GET /shot?film_id=F&shot_id=S
 
 GET /film/F
     -> 200 {"film_id", "snapshot_seq", "count", "shots": [...]}
-       The whole response is read from one catalog snapshot: a revision
-       committing mid-request can never split the answer across two states.
+       Streamed (chunked) from one catalog snapshot with keyset pagination,
+       so the answer is internally consistent, bounded in Python memory, and
+       keeps draining while later batches publish. A revision committing
+       mid-request can never split the answer across two states.
 
 GET /stats
     -> 200 staging/snapshot counters
 
 The process runs the synchronization loop in a background thread against the
-same DuckDB file (separate connection), so queries stay responsive while
-catching up. Every catalog mutation is one DuckDB transaction; read-only
-query connections see a consistent snapshot for the duration of a request.
+same DuckDB file. Every request reads through its own MVCC snapshot (a
+DuckDB cursor), so it answers the last published version immediately -- even
+while the sync thread is inside a large uncommitted ``apply_range``
+transaction for a cross-page batch. Queries never take the writer's lock.
+The snapshot is released when the response completes or the client
+disconnects.
 """
 
 from __future__ import annotations
@@ -39,6 +44,10 @@ from .sync import LogSourceClient, SyncEngine
 
 log = logging.getLogger("shot_catalog.server")
 
+# Streamed responses are flushed in bounded pieces; a listing of 100k shots
+# never exists as one Python string or one socket buffer.
+_STREAM_CHUNK_BYTES = 64 * 1024
+
 
 def build_handler(catalog: Catalog) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -55,18 +64,87 @@ def build_handler(catalog: Catalog) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        # ---------------------------------------------------------- streaming
+        def _send_chunk(self, data: bytes) -> None:
+            self.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
+            self.wfile.write(data)
+            self.wfile.write(b"\r\n")
+
+        def _send_film_stream(self, film_id: str) -> None:
+            """Stream one film listing from one published snapshot.
+
+            The rows are read page by page inside a single read transaction
+            (its own MVCC snapshot), so the answer is internally consistent
+            and bounded in memory. The connection is never held on the
+            writer: newer batches keep publishing while this response drains.
+            If the client goes away mid-stream, writing raises and the
+            ``with`` block closes the snapshot immediately, releasing it.
+            """
+            disconnected = False
+            with catalog.read_snapshot() as snap:
+                count = snap.film_shot_count(film_id)
+                snapshot_seq = snap.snapshot_seq()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                head = (
+                    '{"film_id":' + json.dumps(film_id, ensure_ascii=False)
+                    + ',"snapshot_seq":' + str(snapshot_seq)
+                    + ',"count":' + str(count)
+                    + ',"shots":['
+                )
+                buf = [head.encode("utf-8")]
+                buflen = len(buf[0])
+                first = True
+                try:
+                    for shot in snap.iter_film_shots(film_id):
+                        item = ("" if first else ",") + json.dumps(
+                            shot, ensure_ascii=False, default=str)
+                        first = False
+                        encoded = item.encode("utf-8")
+                        buf.append(encoded)
+                        buflen += len(encoded)
+                        if buflen >= _STREAM_CHUNK_BYTES:
+                            self._send_chunk(b"".join(buf))
+                            buf, buflen = [], 0
+                    buf.append(b"]}")
+                    self._send_chunk(b"".join(buf))
+                    self.wfile.write(b"0\r\n\r\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    # Client disconnected: stop reading immediately; the with
+                    # block closes the cursor and unpins the snapshot.
+                    disconnected = True
+                    self.close_connection = True
+                except Exception:
+                    # Headers and part of the body are already on the wire, so
+                    # a 500 is impossible. Abort the chunked stream instead of
+                    # pretending it completed: the client sees a truncated
+                    # body and knows the answer is not authoritative. Never
+                    # propagate -- the caller would try to send a second
+                    # response on a connection whose headers are gone.
+                    log.exception("streaming /film/%s failed", film_id)
+                    self.close_connection = True
+                    disconnected = True
+            if disconnected:
+                log.debug("client disconnected while streaming /film/%s", film_id)
+
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
             try:
                 if parsed.path == "/health":
-                    self._send(200, {"status": "ok", **catalog.stats()})
+                    with catalog.read_snapshot() as snap:
+                        self._send(200, {"status": "ok", **snap.stats()})
                 elif parsed.path == "/stats":
-                    self._send(200, catalog.stats())
+                    with catalog.read_snapshot() as snap:
+                        self._send(200, snap.stats())
                 elif parsed.path == "/shot":
                     film_id = qs["film_id"][0]
                     shot_id = qs["shot_id"][0]
-                    shot = catalog.get_shot(film_id, shot_id)
+                    with catalog.read_snapshot() as snap:
+                        shot = snap.get_shot(film_id, shot_id)
                     if shot is None:
                         self._send(404, {
                             "error": "shot not found or currently withdrawn",
@@ -79,7 +157,7 @@ def build_handler(catalog: Catalog) -> type[BaseHTTPRequestHandler]:
                     if not film_id:
                         self._send(400, {"error": "film_id required"})
                     else:
-                        self._send(200, catalog.list_film_shots(film_id))
+                        self._send_film_stream(film_id)
                 else:
                     self._send(404, {"error": "unknown path"})
             except KeyError:

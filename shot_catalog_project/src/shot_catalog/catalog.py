@@ -28,18 +28,39 @@ proportional to group size, never to history size, and no batch is ever
 assembled in Python: the only arguments are two seq integers. Partial
 revisions are honored via per-attribute ``*_changed`` flags; explicit nulls
 flip the flag while carrying a null value, so they can clear an attribute.
+
+Snapshot reads
+==============
+Writes and reads no longer share a lock. Every query opens its own read
+transaction on a DuckDB cursor (an independent connection onto the same
+database). DuckDB's MVCC gives that cursor the last *published* snapshot --
+the state at ``last_snapshot_seq`` -- even while the sync thread is staging
+the next pages or executing a large ``apply_range`` transaction. A paused
+cross-page batch therefore never blocks a point query, a film listing or a
+health check; they simply answer from the previous published version.
+
+A film listing streams with keyset pagination from a single read
+transaction, so the server never materializes the whole answer in Python
+memory, later commits can keep publishing while a slow client drains the
+response, and closing the cursor (on completion or client disconnect)
+releases the pinned snapshot immediately. ``CHECKPOINT`` is best-effort:
+an open reader transaction may veto it, and the WAL is durable regardless.
 """
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 import duckdb
 
 from .log_format import NormalizedRecord
+
+log = logging.getLogger("shot_catalog.catalog")
 
 STAGING_COLUMNS = """
     seq BIGINT PRIMARY KEY,
@@ -177,13 +198,25 @@ class CommitGroup:
 class Catalog:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
-        # One connection guarded by an RLock: DuckDB disallows mixing
-        # read-only and read-write connections to one file in a process.
-        # Reads are short autocommit statements, so a film listing observes
-        # one coherent MVCC snapshot while the sync thread waits its turn.
+        # The writer connection serializes all mutations (the sync thread is
+        # the only writer). Reads NEVER use it: each query opens its own
+        # DuckDB cursor, which is an independent connection onto the same
+        # database and therefore gets its own MVCC snapshot without waiting
+        # for the writer. That is what keeps point queries, film listings and
+        # health checks answerable while a cross-page batch is still being
+        # committed (it answers from the previously published snapshot).
         self._lock = threading.RLock()
         self._conn = duckdb.connect(self.db_path)
         self._stage_ready = False
+        # Guards CHECKPOINT attempts: a checkpoint may fail while any reader
+        # transaction is open. Failures are harmless (the WAL is durable) but
+        # we avoid logging a warning for the expected contention case.
+        self._checkpoint_lock = threading.Lock()
+        # Number of request snapshots currently pinned. Exposed so operators
+        # (and tests) can see that a disconnected client's snapshot was
+        # released rather than leaked.
+        self._readers = 0
+        self._readers_lock = threading.Lock()
         self._init_schema()
 
     # ------------------------------------------------------------------ schema
@@ -237,6 +270,50 @@ class Catalog:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    # ------------------------------------------------------------ read snapshots
+    @contextlib.contextmanager
+    def read_snapshot(self) -> Iterator["ReadSnapshot"]:
+        """Open one consistent, read-only snapshot for a single request.
+
+        The cursor is an independent DuckDB connection, so it starts a fresh
+        read transaction reading the latest *committed* state and is not
+        blocked by (nor does it block) an in-flight writer transaction. The
+        caller must not keep it past the request: closing releases the pinned
+        snapshot so later commits can be cleaned up.
+        """
+        cur = self._conn.cursor()
+        try:
+            cur.execute("BEGIN TRANSACTION")
+        except Exception:
+            cur.close()
+            raise
+        with self._readers_lock:
+            self._readers += 1
+        try:
+            yield ReadSnapshot(cur)
+        finally:
+            try:
+                cur.execute("COMMIT")
+            except Exception:  # pragma: no cover - defensive close
+                pass
+            cur.close()
+            with self._readers_lock:
+                self._readers -= 1
+
+    @property
+    def active_readers(self) -> int:
+        """Number of request snapshots currently pinned."""
+        with self._readers_lock:
+            return self._readers
+
+    def _checkpoint_best_effort(self) -> None:
+        """Try to flush the WAL; an open reader transaction may veto it."""
+        with self._checkpoint_lock:
+            try:
+                self._conn.execute("CHECKPOINT")
+            except duckdb.Error as exc:  # active reader transaction, or WAL busy
+                log.debug("checkpoint deferred: %s", exc)
 
     # ------------------------------------------------------------------ staging
     def stage_records(self, records: Iterable[NormalizedRecord]) -> int:
@@ -363,6 +440,39 @@ class Catalog:
             return None
         return int(row[0]), row[1]
 
+    def ordinary_run_end(self, start_seq: int, limit_seq: int) -> int:
+        """Last seq of the contiguous ordinary run that starts at ``start_seq``.
+
+        The run may not exceed ``limit_seq`` and ends just before the first
+        unstaged seq, the first row carrying a ``batch_id``, or the limit.
+        Evaluated in one set-based statement instead of a per-seq Python walk,
+        so coalescing a 100k-record prefix costs a handful of queries rather
+        than 100k round trips.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                WITH r AS (
+                    SELECT seq, batch_id,
+                           row_number() OVER (ORDER BY seq) AS rn
+                    FROM event_staging
+                    WHERE seq BETWEEN $start AND $lim
+                )
+                SELECT coalesce(min(seq) FILTER (
+                           WHERE batch_id IS NOT NULL
+                              OR seq <> $start + rn - 1), $lim + 1) - 1
+                       AS first_break,
+                       max(seq) AS last_staged
+                FROM r
+                """,
+                {"start": start_seq, "lim": limit_seq},
+            ).fetchone()
+        first_break = int(row[0]) if row[0] is not None else limit_seq
+        last_staged = int(row[1]) if row[1] is not None else start_seq
+        # first_break is the last seq before the break; never past the staged
+        # tail, since seqs beyond it are simply absent from the window.
+        return max(start_seq, min(first_break, last_staged))
+
     # ----------------------------------------------------------------- commits
     def compact_staging(self) -> None:
         """Rewrite event_staging in seq order.
@@ -390,10 +500,11 @@ class Catalog:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
-            conn.execute("CHECKPOINT")
+            self._checkpoint_best_effort()
 
     def apply_range(self, start_seq: int, end_seq: int, batch_id: str | None,
-                    *, force_checkpoint: bool = False) -> None:
+                    *, force_checkpoint: bool = False,
+                    before_commit: Callable[[], None] | None = None) -> None:
         """Atomically fold staging rows [start_seq, end_seq] into shot_state.
 
         All set-based processing happens inside DuckDB; the Python process
@@ -401,6 +512,10 @@ class Catalog:
         materialized in Python memory. The WAL makes every commit durable
         across process kills; an explicit CHECKPOINT is only forced after a
         same-batch revision to keep the main file current at major boundaries.
+
+        ``before_commit`` (test/demo hook) runs while the transaction is still
+        uncommitted. That models the worst case for readers: a large
+        cross-page revision has done all its work but has not published yet.
         """
         with self._lock:
             conn = self._conn
@@ -459,6 +574,8 @@ class Catalog:
                     ('last_commit_at', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'))
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
                 """, [batch_id or ""])
+                if before_commit is not None:
+                    before_commit()
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -467,7 +584,9 @@ class Catalog:
                 # Flush the WAL so a kill -9 immediately afterwards still
                 # leaves coherent on-disk state to resume from. Ordinary
                 # commits rely on the WAL itself, which is equally durable.
-                conn.execute("CHECKPOINT")
+                # An active reader transaction may refuse the flush; that is
+                # safe (WAL replay recovers it) and must not fail the commit.
+                self._checkpoint_best_effort()
 
     # ------------------------------------------------------------- verification
     def rebuild_mismatch_count(self) -> int:
@@ -505,51 +624,124 @@ class Catalog:
 
     # ----------------------------------------------------------------- queries
     def snapshot_seq(self) -> int:
-        return self.last_snapshot_seq()
+        # Read through a snapshot, not the writer connection: observing the
+        # published pointer must not wait behind an in-flight apply_range.
+        with self.read_snapshot() as snap:
+            return snap.snapshot_seq()
 
     def get_shot(self, film_id: str, shot_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT * FROM catalog_current WHERE film_id = ? AND shot_id = ?",
-                [film_id, shot_id],
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            cols = [d[0] for d in cur.description]
-            return _row_to_dict(cols, row)
+        with self.read_snapshot() as snap:
+            return snap.get_shot(film_id, shot_id)
 
     def list_film_shots(self, film_id: str) -> dict[str, Any]:
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT * FROM catalog_current WHERE film_id = ? ORDER BY shot_id",
-                [film_id],
-            )
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-            snapshot = self._conn.execute(
-                "SELECT last_snapshot_seq FROM sync_state WHERE id = 1"
-            ).fetchone()[0]
-            shots = [_row_to_dict(cols, row) for row in rows]
+        with self.read_snapshot() as snap:
+            return snap.list_film_shots(film_id)
+
+    def stats(self) -> dict[str, Any]:
+        with self.read_snapshot() as snap:
+            return snap.stats()
+
+
+class ReadSnapshot:
+    """One MVCC snapshot, owned by a single request.
+
+    All accessors read through the same open read transaction, so they see
+    one published version of the catalog even if the sync thread commits in
+    between calls. ``iter_film_shots`` streams with keyset pagination, which
+    keeps Python memory bounded regardless of film size and lets the writer
+    publish newer versions while a slow response is being drained.
+    """
+
+    # Column order of the rows returned by the shot SELECTs.
+    _COLUMNS = (
+        "film_id", "shot_id", "version", "last_event_seq", "last_ts",
+        "title", "description", "duration_ms", "scene", "camera", "repair_note",
+    )
+    _SHOT_SQL = (
+        "SELECT film_id, shot_id, version, last_event_seq, last_ts, "
+        "title, description, duration_ms, scene, camera, repair_note "
+        "FROM catalog_current"
+    )
+
+    def __init__(self, cur: duckdb.DuckDBPyConnection):
+        self._cur = cur
+
+    def snapshot_seq(self) -> int:
+        row = self._cur.execute(
+            "SELECT last_snapshot_seq FROM sync_state WHERE id = 1"
+        ).fetchone()
+        return int(row[0])
+
+    def get_shot(self, film_id: str, shot_id: str) -> dict[str, Any] | None:
+        row = self._cur.execute(
+            self._SHOT_SQL + " WHERE film_id = ? AND shot_id = ?",
+            [film_id, shot_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_dict(self._COLUMNS, row)
+
+    def film_shot_count(self, film_id: str) -> int:
+        row = self._cur.execute(
+            "SELECT count(*) FROM catalog_current WHERE film_id = ?", [film_id]
+        ).fetchone()
+        return int(row[0])
+
+    def iter_film_shots(self, film_id: str, *, page_size: int = 1000
+                        ) -> Iterator[dict[str, Any]]:
+        """Yield the film's visible shots in shot_id order, keyset-paged.
+
+        Every page is read inside the same transaction, so the concatenation
+        is one published version of the film. Only ``page_size`` rows live in
+        Python at a time; ``shot_id > last`` uses the (film_id, shot_id)
+        primary key, so a 100k-shot film costs a bounded amount of memory and
+        work per page. If the consumer stops early (client disconnect), the
+        generator is closed and the caller's ``read_snapshot`` releases the
+        snapshot.
+        """
+        last: str | None = None
+        while True:
+            if last is None:
+                rows = self._cur.execute(
+                    self._SHOT_SQL + " WHERE film_id = ? ORDER BY shot_id LIMIT ?",
+                    [film_id, page_size],
+                ).fetchall()
+            else:
+                rows = self._cur.execute(
+                    self._SHOT_SQL
+                    + " WHERE film_id = ? AND shot_id > ? ORDER BY shot_id LIMIT ?",
+                    [film_id, last, page_size],
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield _row_to_dict(self._COLUMNS, row)
+            last = rows[-1][1]
+            if len(rows) < page_size:
+                return
+
+    def list_film_shots(self, film_id: str) -> dict[str, Any]:
+        shots = list(self.iter_film_shots(film_id))
         return {
             "film_id": film_id,
-            "snapshot_seq": int(snapshot),
+            "snapshot_seq": self.snapshot_seq(),
             "count": len(shots),
             "shots": shots,
         }
 
     def stats(self) -> dict[str, Any]:
-        with self._lock:
-            staged = self._conn.execute("SELECT count(*), max(seq) FROM event_staging").fetchone()
-            visible = self._conn.execute("SELECT count(*) FROM catalog_current").fetchone()[0]
-            films = self._conn.execute(
-                "SELECT count(DISTINCT film_id) FROM catalog_current"
-            ).fetchone()[0]
-            snapshot = self._conn.execute(
-                "SELECT last_snapshot_seq FROM sync_state WHERE id = 1"
-            ).fetchone()[0]
+        staged = self._cur.execute(
+            "SELECT count(*), max(seq) FROM event_staging"
+        ).fetchone()
+        visible = self._cur.execute(
+            "SELECT count(*) FROM catalog_current"
+        ).fetchone()[0]
+        films = self._cur.execute(
+            "SELECT count(DISTINCT film_id) FROM catalog_current"
+        ).fetchone()[0]
+        snapshot = self.snapshot_seq()
         return {
-            "snapshot_seq": int(snapshot),
+            "snapshot_seq": snapshot,
             "staged_events": int(staged[0]),
             "max_staged_seq": int(staged[1] or 0),
             "visible_shots": int(visible),
@@ -557,7 +749,7 @@ class Catalog:
         }
 
 
-def _row_to_dict(cols: list[str], row: tuple) -> dict[str, Any]:
+def _row_to_dict(cols: tuple[str, ...] | list[str], row: tuple) -> dict[str, Any]:
     out = dict(zip(cols, row))
     for key in ("duration_ms", "last_event_seq", "version"):
         if out.get(key) is not None:
